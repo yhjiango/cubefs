@@ -238,6 +238,12 @@ func (m *Server) loadMetadata() {
 		panic(err)
 	}
 	log.LogInfo("action[loadS3QoSInfo] end")
+
+	log.LogInfo("action[loadCRRConfs] begin")
+	if err = m.cluster.loadCRRConfs(); err != nil {
+		panic(err)
+	}
+	log.LogInfo("action[loadCRRConfs] end")
 }
 
 func (m *Server) clearMetadata() {

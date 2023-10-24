@@ -432,6 +432,17 @@ func (m *Server) registerAPIRoutes(router *mux.Router) {
 		Path(proto.AdminLcNode).
 		HandlerFunc(m.lcnodeInfo)
 
+	// Cross Region Replication Configuration APIS
+	router.NewRoute().Methods(http.MethodPut, http.MethodPost).
+		Path(proto.SetCRR).
+		HandlerFunc(m.SetCRR)
+	router.NewRoute().Methods(http.MethodGet, http.MethodPost).
+		Path(proto.GetCRR).
+		HandlerFunc(m.GetCRR)
+	router.NewRoute().Methods(http.MethodDelete, http.MethodPost).
+		Path(proto.DeleteCRR).
+		HandlerFunc(m.DeleteCRR)
+
 	// node task response APIs
 	router.NewRoute().Methods(http.MethodGet, http.MethodPost).
 		Path(proto.GetDataNodeTaskResponse).

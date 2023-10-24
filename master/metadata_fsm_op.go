@@ -1587,6 +1587,27 @@ func (c *Cluster) loadS3ApiQosInfo() (err error) {
 	return
 }
 
+// load crr confs to memory cache
+func (c *Cluster) loadCRRConfs() (err error) {
+	keyPrefix := CRRPrefix
+	result, err := c.fsm.store.SeekForPrefix([]byte(keyPrefix))
+	if err != nil {
+		err = fmt.Errorf("loadCRRConfs get failed, err [%v]", err)
+		return err
+	}
+
+	for _, value := range result {
+		CRRConf := &bsProto.CRRConfiguration{}
+		if err = json.Unmarshal(value, CRRConf); err != nil {
+			err = fmt.Errorf("action[loadCRRConfs],value:%v,unmarshal err:%v", string(value), err)
+			return
+		}
+		log.LogDebugf("loadCRRConfs volume[%v] rules[%+v]", CRRConf.VolName, CRRConf.Rules)
+		c.CRRMgr.SetCRR(CRRConf)
+	}
+	return
+}
+
 func (c *Cluster) addBadDataPartitionIdMap(dp *DataPartition) {
 	if !dp.IsDecommissionRunning() {
 		return

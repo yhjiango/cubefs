@@ -126,6 +126,7 @@ const (
 	OpLcNodeHeartbeat      uint8 = 0x55
 	OpLcNodeScan           uint8 = 0x56
 	OpLcNodeSnapshotVerDel uint8 = 0x57
+	OpLcNodeCRR            uint8 = 0x58
 
 	// Operations: Master -> DataNode
 	OpCreateDataPartition           uint8 = 0x60

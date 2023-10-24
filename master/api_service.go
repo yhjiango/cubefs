@@ -30,6 +30,7 @@ import (
 	"golang.org/x/time/rate"
 
 	"github.com/cubefs/cubefs/proto"
+	"github.com/cubefs/cubefs/sdk/master"
 	"github.com/cubefs/cubefs/util"
 	"github.com/cubefs/cubefs/util/compressor"
 	"github.com/cubefs/cubefs/util/cryptoutil"
@@ -6315,10 +6316,121 @@ func isS3QosConfigValid(param *proto.S3QosRequest) bool {
 	if param.Type != proto.FlowLimit && param.Type != proto.QPSLimit && param.Type != proto.ConcurrentLimit {
 		return false
 	}
-
 	if proto.IsS3PutApi(param.Api) {
 		return false
 	}
-
 	return true
+}
+
+func (m *Server) SetCRR(w http.ResponseWriter, r *http.Request) {
+	var (
+		param = &proto.CRRConfiguration{}
+		data  []byte
+		err   error
+	)
+	metric := exporter.NewTPCnt(apiToMetricsName(proto.SetCRR))
+	defer func() {
+		doStatAndMetric(proto.SetCRR, metric, err, nil)
+	}()
+
+	if data, err = parseCRRReq(r, param); err != nil {
+		log.LogErrorf("[SetCRR] parse fail err [%v]", err)
+		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeParamError, Msg: err.Error()})
+		return
+	}
+	if _, err := isCRRConfigValid(m.cluster, param); err != nil {
+		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeParamError, Msg: err.Error()})
+		return
+	}
+
+	// raft sync
+	metadata := new(RaftCmd)
+	metadata.Op = opCRRSet
+	metadata.K = CRRPrefix + param.VolName
+	metadata.V = data
+	if err = m.cluster.submit(metadata); err != nil {
+		sendErrReply(w, r, newErrHTTPReply(err))
+		return
+	}
+	// memory cache
+	m.cluster.CRRMgr.SetCRR(param)
+	sendOkReply(w, r, newSuccessHTTPReply("success"))
+}
+
+func (m *Server) GetCRR(w http.ResponseWriter, r *http.Request) {
+	var (
+		err     error
+		volName string
+		CRRConf *proto.CRRConfiguration
+	)
+	if volName, err = parseAndExtractName(r); err != nil {
+		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeParamError, Msg: err.Error()})
+		return
+	}
+	if _, err = m.cluster.getVol(volName); err != nil {
+		sendErrReply(w, r, newErrHTTPReply(proto.ErrVolNotExists))
+		return
+	}
+	CRRConf = m.cluster.CRRMgr.GetCRR(volName)
+	if CRRConf == nil {
+		sendErrReply(w, r, newErrHTTPReply(proto.ErrNoSuchCRRConfig))
+	}
+	sendOkReply(w, r, newSuccessHTTPReply(CRRConf))
+}
+
+func (m *Server) DeleteCRR(w http.ResponseWriter, r *http.Request) {
+	var (
+		err     error
+		volName string
+	)
+	if volName, err = parseAndExtractName(r); err != nil {
+		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeParamError, Msg: err.Error()})
+		return
+	}
+	if _, err = m.cluster.getVol(volName); err != nil {
+		sendErrReply(w, r, newErrHTTPReply(proto.ErrVolNotExists))
+		return
+	}
+
+	// raft sync
+	metadata := new(RaftCmd)
+	metadata.Op = opCRRDelete
+	metadata.K = CRRPrefix + volName
+	if err = m.cluster.submit(metadata); err != nil {
+		sendErrReply(w, r, newErrHTTPReply(err))
+		return
+	}
+	// memory cache
+	m.cluster.CRRMgr.DeleteCRR(volName)
+	sendOkReply(w, r, newSuccessHTTPReply("success"))
+}
+
+func isCRRConfigValid(cluster *Cluster, param *proto.CRRConfiguration) (bool, error) {
+	if len(param.Rules) == 0 {
+		return false, errors.New("Rule is empty")
+	}
+	for _, rule := range param.Rules {
+		if rule.RuleID == "" {
+			return false, errors.New("RuleID is empty")
+		}
+		if rule.Status != proto.CRRStatusEnabled && rule.Status != proto.CRRStatusDisabled {
+			return false, errors.New("Rule status is not valid")
+		}
+		// same region
+		if rule.MasterAddr == "" {
+			if cluster.vols[param.VolName].Owner != cluster.vols[rule.DstVolName].Owner {
+				return false, errors.NewErrorf("Same region replication, but %s and %s do not belong to the same user",
+					param.VolName, rule.DstVolName)
+			}
+			continue
+		}
+		// cross region
+		addr := []string{rule.MasterAddr}
+		mc := master.NewMasterClient(addr, false)
+		_, err := mc.AdminAPI().GetVolumeSimpleInfo(rule.DstVolName)
+		if err != nil {
+			return false, err
+		}
+	}
+	return true, nil
 }

@@ -286,6 +286,8 @@ const (
 
 	opSyncS3QosSet    uint32 = 0x60
 	opSyncS3QosDelete uint32 = 0x61
+	opCRRSet          uint32 = 0x62
+	opCRRDelete       uint32 = 0x63
 )
 
 const (
@@ -305,6 +307,7 @@ const (
 	apiLimiterAcronym      = "al"
 	lcConfigurationAcronym = "lc"
 	S3QoS                  = "s3qos"
+	CRR                    = "crr"
 	maxDataPartitionIDKey  = keySeparator + "max_dp_id"
 	maxMetaPartitionIDKey  = keySeparator + "max_mp_id"
 	maxCommonIDKey         = keySeparator + "max_common_id"
@@ -339,6 +342,7 @@ const (
 	lcNodePrefix     = keySeparator + lcNodeAcronym + keySeparator
 	lcConfPrefix     = keySeparator + lcConfigurationAcronym + keySeparator
 	S3QoSPrefix      = keySeparator + S3QoS + keySeparator
+	CRRPrefix        = keySeparator + CRR + keySeparator
 )
 
 // selector enum

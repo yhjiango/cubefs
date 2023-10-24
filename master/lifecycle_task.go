@@ -51,6 +51,9 @@ func (c *Cluster) handleLcNodeTaskResponse(nodeAddr string, task *proto.AdminTas
 	case proto.OpLcNodeSnapshotVerDel:
 		response := task.Response.(*proto.SnapshotVerDelTaskResponse)
 		err = c.handleLcNodeSnapshotScanResp(task.OperatorAddr, response)
+	case proto.OpLcNodeCRR:
+		response := task.Response.(*proto.LcNodeCRRTaskResponse)
+		err = c.handleLcNodeCRRScanResp(task.OperatorAddr, response)
 	default:
 		err = fmt.Errorf(fmt.Sprintf("lc unknown operate code %v", task.OpCode))
 		goto errHandler
@@ -135,6 +138,24 @@ func (c *Cluster) handleLcNodeHeartbeatResp(nodeAddr string, resp *proto.LcNodeH
 		}
 	}
 
+	// handle CRRScanningTasks
+	if len(resp.CRRScanningTasks) != 0 {
+		for _, taskRsp := range resp.CRRScanningTasks {
+			c.CRRMgr.CRRRuleTaskStatus.Lock()
+			if c.CRRMgr.CRRRuleTaskStatus.Results[taskRsp.Id] != nil && c.lcMgr.lcRuleTaskStatus.Results[taskRsp.Id].Done {
+				log.LogInfof("action[handleLcNodeHeartbeatResp], lcNode[%v] task[%v] already done", nodeAddr, taskRsp.Id)
+			} else {
+				c.CRRMgr.CRRRuleTaskStatus.Results[taskRsp.Id] = taskRsp
+			}
+			c.CRRMgr.CRRRuleTaskStatus.Unlock()
+			log.LogDebugf("action[handleLcNodeHeartbeatResp], lcNode[%v] taskRsp: %v", nodeAddr, taskRsp)
+		}
+	} else {
+		log.LogInfof("action[handleLcNodeHeartbeatResp], lcNode[%v] is idle for CRRScanningTasks", nodeAddr)
+		c.CRRMgr.CRRRuleTaskStatus.DeleteScanningTask(c.CRRMgr.lcNodeStatus.ReleaseNode(nodeAddr))
+		c.CRRMgr.notifyIdleLcNode()
+	}
+
 	log.LogInfof("action[handleLcNodeHeartbeatResp], lcNode[%v], heartbeat success", nodeAddr)
 	return
 }
@@ -190,5 +211,26 @@ func (c *Cluster) handleLcNodeSnapshotScanResp(nodeAddr string, resp *proto.Snap
 		log.LogInfof("action[handleLcNodeSnapshotScanResp] scanning received, resp(%v)", resp)
 	}
 
+	return
+}
+
+func (c *Cluster) handleLcNodeCRRScanResp(nodeAddr string, resp *proto.LcNodeCRRTaskResponse) (err error) {
+	log.LogDebugf("action[handleLcNodeCRRScanResp] lcNode[%v] task[%v] Enter", nodeAddr, resp.Id)
+	defer func() {
+		log.LogDebugf("action[handleLcNodeCRRScanResp] lcNode[%v] task[%v] Exit", nodeAddr, resp.Id)
+	}()
+
+	switch resp.Status {
+	case proto.TaskFailed:
+		c.CRRMgr.CRRRuleTaskStatus.RedoTask(resp.Id)
+	case proto.TaskSucceeds:
+		c.CRRMgr.CRRRuleTaskStatus.AddResult(resp)
+		c.CRRMgr.CRRRuleTaskStatus.DeleteScanningTask(resp.Id)
+	default:
+		log.LogInfof("action[handleLcNodeCRRScanResp] scanning received, resp(%v)", resp)
+		return
+	}
+	c.CRRMgr.lcNodeStatus.ReleaseNode(nodeAddr)
+	log.LogInfof("action[handleLcNodeCRRScanResp] scanning completed, resp(%v)", resp)
 	return
 }

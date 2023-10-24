@@ -1845,7 +1845,18 @@ func parseS3QosReq(r *http.Request, req *proto.S3QosRequest) (err error) {
 	if err = json.Unmarshal(body, &req); err != nil {
 		return
 	}
-
 	log.LogInfo("parseS3QosReq success.")
+	return
+}
+
+func parseCRRReq(r *http.Request, req *proto.CRRConfiguration) (data []byte, err error) {
+	var body []byte
+	if body, err = ioutil.ReadAll(r.Body); err != nil {
+		return
+	}
+	if err = json.Unmarshal(body, &req); err != nil {
+		return
+	}
+	log.LogInfo("parseCRRReq success.")
 	return
 }
