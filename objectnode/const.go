@@ -45,6 +45,7 @@ const (
 	Signature          = "Signature"
 	Origin             = "Origin"
 	UserAgent          = "User-Agent"
+	XReqestID          = "X-Reqid"
 
 	AccessControlRequestMethod    = "Access-Control-Request-Method"
 	AccessControlRequestHeaders   = "Access-Control-Request-Headers"
@@ -90,7 +91,15 @@ const (
 )
 
 const (
+	XCfsSourceFrom    = "x-cfs-source-from"
+	XCfsSourceAcl     = "x-cfs-source-acl"
+	XCfsSourceETag    = "x-cfs-source-etag"
+	XCfsSourcePutTime = "x-cfs-source-puttime"
+)
+
+const (
 	ValueServer               = "CubeFS"
+	ValueReplication          = "replication"
 	ValueAcceptRanges         = "bytes"
 	ValueContentTypeStream    = "application/octet-stream"
 	ValueContentTypeXML       = "application/xml"
@@ -154,6 +163,8 @@ const (
 	XAttrKeyOSSLock         = "oss:lock"
 	XAttrKeyOSSCacheControl = "oss:cache"
 	XAttrKeyOSSExpires      = "oss:expires"
+	XAttrKeyOSSPutTime      = "oss:puttime"
+	XAttrKeyOSSReplication  = "oss:replication"
 
 	// Deprecated
 	XAttrKeyOSSETagDeprecated = "oss:tag"

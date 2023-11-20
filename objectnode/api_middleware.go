@@ -88,6 +88,7 @@ func (o *ObjectNode) traceMiddleware(next http.Handler) http.Handler {
 		return strings.ReplaceAll(uUID.String(), "-", ""), nil
 	}
 	var handlerFunc http.HandlerFunc = func(w http.ResponseWriter, r *http.Request) {
+		var err error
 		// wrapper for w to record its stats
 		w = NewResponseStater(w)
 		defer func() {
@@ -102,14 +103,18 @@ func (o *ObjectNode) traceMiddleware(next http.Handler) http.Handler {
 			}
 		}()
 
-		requestID, err := generateRequestID()
-		if err != nil {
-			log.LogErrorf("traceMiddleware: generate request ID fail, remote(%v) url(%v) err(%v)",
-				r.RemoteAddr, r.URL.String(), err)
-			InternalErrorCode(err).ServeResponse(w, r)
-			// export ump warn info
-			exporter.Warning(generateWarnDetail(r, err.Error()))
-			return
+		requestID := r.Header.Get(XAmzRequestId)
+		if requestID == "" {
+			if requestID = r.Header.Get(XReqestID); requestID == "" {
+				if requestID, err = generateRequestID(); err != nil {
+					log.LogErrorf("traceMiddleware: generate request ID fail, remote(%v) url(%v) err(%v)",
+						r.RemoteAddr, r.URL.String(), err)
+					InternalErrorCode(err).ServeResponse(w, r)
+					// export ump warn info
+					exporter.Warning(generateWarnDetail(r, err.Error()))
+					return
+				}
+			}
 		}
 
 		// store request ID to context and write to header

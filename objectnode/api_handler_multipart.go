@@ -101,38 +101,58 @@ func (o *ObjectNode) createMultipleUploadHandler(w http.ResponseWriter, r *http.
 	metadata := ParseUserDefinedMetadata(r.Header)
 
 	// Check 'x-amz-tagging' header
-	var tagging *Tagging
+	var taggingVal string
 	if xAmxTagging := r.Header.Get(XAmzTagging); xAmxTagging != "" {
+		var tagging *Tagging
 		if tagging, err = ParseTagging(xAmxTagging); err != nil {
 			errorCode = InvalidArgument
 			return
 		}
+		if err = tagging.Validate(); err != nil {
+			return
+		}
+		taggingVal = tagging.Encode()
 	}
+
+	// Check 'x-cfs-source-puttime' header
+	var putTime int64
+	if srcPutTime := r.Header.Get(XCfsSourcePutTime); srcPutTime != "" {
+		if putTime, err = strconv.ParseInt(srcPutTime, 10, 64); err != nil {
+			log.LogErrorf("createMultipleUploadHandler: invalid putTime: requestID(%v) path(%v) putTime(%v) err(%v)",
+				GetRequestID(r), param.Object(), srcPutTime, err)
+			errorCode = InvalidSourcePutTime
+			return
+		}
+	}
+
 	// Check ACL
-	var acl *AccessControlPolicy
-	acl, err = ParseACL(r, userInfo.UserID, false, vol.GetOwner() != userInfo.UserID)
+	aclVal, err := ParseRequestACL(r, userInfo.UserID, false, vol.GetOwner() != userInfo.UserID)
 	if err != nil {
-		log.LogErrorf("createMultipleUploadHandler: parse acl fail: requestID(%v) acl(%+v) err(%v)",
-			GetRequestID(r), acl, err)
+		log.LogErrorf("createMultipleUploadHandler: parse acl fail: requestID(%v) volume(%v) err(%v)",
+			GetRequestID(r), param.Bucket(), err)
 		return
 	}
+
+	// Init multipart
 	opt := &PutFileOption{
+		ACL:          string(aclVal),
 		MIMEType:     contentType,
 		Disposition:  contentDisposition,
-		Tagging:      tagging,
+		Tagging:      taggingVal,
 		Metadata:     metadata,
 		CacheControl: cacheControl,
 		Expires:      expires,
-		ACL:          acl,
+		ETag:         r.Header.Get(XCfsSourceETag),
+		PutTime:      putTime,
 	}
-
-	var uploadID string
-	if uploadID, err = vol.InitMultipart(param.Object(), opt); err != nil {
+	uploadID, err := vol.InitMultipart(param.Object(), opt)
+	if err != nil {
 		log.LogErrorf("createMultipleUploadHandler: init multipart fail: requestID(%v) err(%v)",
 			GetRequestID(r), err)
 		return
 	}
 
+	// Write response
 	initResult := InitMultipartResult{
 		Bucket:   param.Bucket(),
 		Key:      param.Object(),
@@ -227,7 +247,7 @@ func (o *ObjectNode) uploadPartHandler(w http.ResponseWriter, r *http.Request) {
 	// ObjectLock  Config
 	objetLock, err := vol.metaLoader.loadObjectLock()
 	if err != nil {
-		log.LogErrorf("putObjectHandler: load volume objetLock: requestID(%v)  volume(%v) err(%v)",
+		log.LogErrorf("uploadPartHandler: load volume objetLock: requestID(%v)  volume(%v) err(%v)",
 			GetRequestID(r), param.Bucket(), err)
 		return
 	}
@@ -704,6 +724,7 @@ func (o *ObjectNode) completeMultipartUploadHandler(w http.ResponseWriter, r *ht
 		errorCode = MalformedXML
 		return
 	}
+
 	// check part parameter
 	partsLen := len(multipartUploadRequest.Parts)
 	if partsLen > MaxPartNumberValid {
@@ -753,6 +774,7 @@ func (o *ObjectNode) completeMultipartUploadHandler(w http.ResponseWriter, r *ht
 		return
 	}
 
+	// check complete parts
 	discardedInods, committedPartInfo, err := o.checkReqParts(param, multipartUploadRequest, multipartInfo)
 	if err != nil {
 		log.LogWarnf("completeMultipartUploadHandler: check request parts fail: requestID(%v) path(%v) err(%v)",
@@ -773,6 +795,14 @@ func (o *ObjectNode) completeMultipartUploadHandler(w http.ResponseWriter, r *ht
 		return
 	}
 
+	// object replication
+	vol.ObjectReplication(fsFileInfo, nil, ReplicationOptions{
+		OpType:             MultipartReplicationType,
+		RequestID:          GetRequestID(r),
+		ReplicationRequest: r.Header.Get(XCfsSourceFrom) == ValueReplication,
+	})
+
+	// write response
 	completeResult := CompleteMultipartResult{
 		Bucket: param.Bucket(),
 		Key:    param.Object(),
@@ -780,7 +810,7 @@ func (o *ObjectNode) completeMultipartUploadHandler(w http.ResponseWriter, r *ht
 	}
 	response, ierr := MarshalXMLEntity(completeResult)
 	if ierr != nil {
-		log.LogErrorf("completeMultipartUploadHandler: xml marshal result fail: requestID(%v) result(%v) err(%v)",
+		log.LogWarnf("completeMultipartUploadHandler: xml marshal result fail: requestID(%v) result(%v) err(%v)",
 			GetRequestID(r), completeResult, ierr)
 	}
 

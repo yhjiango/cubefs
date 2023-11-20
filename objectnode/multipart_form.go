@@ -24,6 +24,8 @@ import (
 	"net/url"
 	"os"
 	"strings"
+
+	"github.com/cubefs/cubefs/util/flowctrl"
 )
 
 type FormRequest struct {
@@ -109,7 +111,7 @@ func (r *FormRequest) FileName() string {
 
 // FormFile returns the File for file key in POST form.
 // FormFile calls ParseMultipartForm if necessary.
-func (r *FormRequest) FormFile(maxMemory int64) (f multipart.File, size int64, err error) {
+func (r *FormRequest) FormFile(maxMemory int64, ctrl *flowctrl.Controller) (f multipart.File, size int64, err error) {
 	if r.MultipartForm == nil {
 		if err = r.ParseMultipartForm(); err != nil {
 			return
@@ -131,7 +133,12 @@ func (r *FormRequest) FormFile(maxMemory int64) (f multipart.File, size int64, e
 		if err != nil {
 			return
 		}
-		size, err = io.Copy(file, io.MultiReader(&b, r.Body))
+		var reader io.Reader
+		reader = r.Body
+		if ctrl != nil {
+			reader = flowctrl.NewRateReaderWithCtrl(reader, ctrl)
+		}
+		size, err = io.Copy(file, io.MultiReader(&b, reader))
 		if cerr := file.Close(); err == nil {
 			err = cerr
 		}

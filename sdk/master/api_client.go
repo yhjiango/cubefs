@@ -129,3 +129,17 @@ func (api *ClientAPI) GetPreLoadDataPartitions(volName string) (view *proto.Data
 		Header(api.h).addParam("name", volName))
 	return
 }
+
+func (api *ClientAPI) GetCRRConfiguration(volName string) (config *proto.CRRConfiguration, err error) {
+	var request = newAPIRequest(http.MethodGet, proto.GetCRR)
+	request.addParam("name", volName)
+	var data []byte
+	if data, err = api.mc.serveRequest(request); err != nil {
+		return
+	}
+	config = &proto.CRRConfiguration{}
+	if err = json.Unmarshal(data, config); err != nil {
+		return
+	}
+	return
+}

@@ -15,6 +15,7 @@
 package objectnode
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
@@ -212,4 +213,33 @@ func putObjectACL(vol *Volume, path string, acp *AccessControlPolicy) error {
 		return err
 	}
 	return vol.SetXAttr(path, XAttrKeyOSSACL, data, false)
+}
+
+func ParseACLFromByte(raw []byte) (*AccessControlPolicy, error) {
+	var acl AccessControlPolicy
+	err := json.Unmarshal(raw, &acl)
+	if err != nil {
+		err = xml.Unmarshal(raw, &acl)
+	}
+
+	return &acl, err
+}
+
+func ParseRequestACL(req *http.Request, owner string, hasBodyAcl, needDefault bool) ([]byte, error) {
+	// s3 acl parameters ignored when request with x-cfs-source-acl
+	if srcAcl := req.Header.Get(XCfsSourceAcl); srcAcl != "" {
+		if aclBytes, err := base64.StdEncoding.DecodeString(srcAcl); err == nil {
+			if acl, err := ParseACLFromByte(aclBytes); err == nil {
+				return aclBytes, acl.IsValid()
+			}
+		}
+		return nil, InvalidSourceACL
+	}
+
+	acl, err := ParseACL(req, owner, hasBodyAcl, needDefault)
+	if err != nil || acl == nil {
+		return nil, err
+	}
+
+	return acl.Encode()
 }

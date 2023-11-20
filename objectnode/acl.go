@@ -22,7 +22,6 @@ import (
 	"net/http"
 
 	"github.com/cubefs/cubefs/proto"
-	"github.com/cubefs/cubefs/util/log"
 )
 
 const (
@@ -229,10 +228,6 @@ func (acp *AccessControlPolicy) XmlMarshal() ([]byte, error) {
 	return append([]byte(xml.Header), data...), nil
 }
 
-func (acp *AccessControlPolicy) Encode() string {
-	data, err := json.Marshal(acp)
-	if err != nil {
-		log.LogWarnf("acl json marshal failed: %v", err)
-	}
-	return string(data)
+func (acp *AccessControlPolicy) Encode() ([]byte, error) {
+	return json.Marshal(acp)
 }

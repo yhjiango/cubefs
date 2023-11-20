@@ -20,6 +20,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"hash"
 	"io"
@@ -84,14 +85,57 @@ type VolumeConfig struct {
 }
 
 type PutFileOption struct {
+	ACL          string
 	MIMEType     string
 	Disposition  string
-	Tagging      *Tagging
-	ACL          *AccessControlPolicy
-	Metadata     map[string]string
+	Tagging      string
 	CacheControl string
+	ETag         string
 	Expires      string
+	PutTime      int64
+	Metadata     map[string]string
 	ObjectLock   *ObjectLockConfig
+}
+
+func (o *PutFileOption) ToXAttrs() map[string]string {
+	xAttrs := make(map[string]string)
+	if o != nil {
+		if o.ACL != "" {
+			xAttrs[XAttrKeyOSSACL] = o.ACL
+		}
+		if o.CacheControl != "" {
+			xAttrs[XAttrKeyOSSCacheControl] = o.CacheControl
+		}
+		if o.Disposition != "" {
+			xAttrs[XAttrKeyOSSDISPOSITION] = o.Disposition
+		}
+		if o.Expires != "" {
+			xAttrs[XAttrKeyOSSExpires] = o.Expires
+		}
+		if o.MIMEType != "" {
+			xAttrs[XAttrKeyOSSMIME] = o.MIMEType
+		}
+		if o.Tagging != "" {
+			xAttrs[XAttrKeyOSSTagging] = o.Tagging
+		}
+		if o.ETag != "" {
+			xAttrs[XAttrKeyOSSETag] = o.ETag
+		}
+		if o.PutTime != 0 {
+			xAttrs[XAttrKeyOSSPutTime] = strconv.FormatInt(o.PutTime, 10)
+		}
+
+		for k, v := range o.Metadata {
+			xAttrs[k] = v
+		}
+	}
+
+	return xAttrs
+}
+
+type DeleteFileOption struct {
+	ETag    string
+	PutTime int64
 }
 
 type ListFilesV1Option struct {
@@ -130,6 +174,7 @@ type ListFilesV2Result struct {
 // A high-level approach that exposes the semantics of object storage to the outside world.
 // Volume escapes high-level object storage semantics to low-level POSIX semantics.
 type Volume struct {
+	mc         *master.MasterClient
 	mw         *meta.MetaWrapper
 	ec         *stream.ExtentClient
 	store      Store // Storage for ACP management
@@ -138,6 +183,9 @@ type Volume struct {
 	metaLoader ossMetaLoader
 	ticker     *time.Ticker
 	createTime int64
+
+	replicator *Replicator
+	replMtx    sync.RWMutex
 
 	volType        int
 	ebsBlockSize   int
@@ -155,6 +203,8 @@ func (v *Volume) GetOwner() string {
 }
 
 func (v *Volume) syncOSSMeta() {
+	v.loadOSSMeta()
+
 	v.ticker = time.NewTicker(OSSMetaUpdateDuration)
 	defer v.ticker.Stop()
 	for {
@@ -198,6 +248,13 @@ func (v *Volume) loadOSSMeta() {
 		return
 	}
 	v.metaLoader.storeObjectLock(objectlock)
+
+	var repl *ReplicationConfig
+	if repl, err = v.loadBucketReplication(); err != nil {
+		return
+	}
+	v.metaLoader.storeReplication(repl)
+
 	v.metaLoader.setSynced()
 }
 
@@ -275,6 +332,83 @@ func (v *Volume) loadObjectLock() (configuration *ObjectLockConfig, err error) {
 		return
 	}
 	return configuration, nil
+}
+
+func (v *Volume) loadBucketReplication() (*ReplicationConfig, error) {
+	crrConfig, err := v.mc.ClientAPI().GetCRRConfiguration(v.name)
+	if err != nil && !errors.Is(err, proto.ErrNoSuchCRRConfig) {
+		log.LogErrorf("loadBucketReplication: crr get from master fail: volume(%v) err(%v)", v.name, err)
+		return nil, err
+	}
+
+	config := &ReplicationConfig{}
+	if crrConfig != nil {
+		log.LogDebugf("loadBucketReplication: volume(%v) crr config(%+v)", v.name, crrConfig)
+		for _, crrRule := range crrConfig.Rules {
+			rule := ReplicationRule{
+				Prefix: crrRule.Prefix,
+				Destination: ReplicationDestination{
+					Bucket:     crrRule.DstS3Cfg.VolName,
+					Region:     crrRule.DstS3Cfg.Region,
+					ObjectAddr: crrRule.DstS3Cfg.S3Addr,
+				},
+			}
+			if crrRule.DstS3Cfg.Auth != nil {
+				rule.Destination.AccessKey = crrRule.DstS3Cfg.Auth.AK
+				rule.Destination.SecretKey = crrRule.DstS3Cfg.Auth.SK
+			}
+			if !crrRule.SyncDelete {
+				rule.DeleteMarker = ReplicationDeleteMarker{
+					Status: ReplDisabled,
+				}
+			}
+			config.Rules = append(config.Rules, rule)
+		}
+	}
+
+	if err = v.initReplication(config); err != nil {
+		panic(fmt.Sprintf("loadBucketReplication: init replication fail: volume(%v) config(%+v) err(%v)",
+			v.name, config, err))
+	}
+
+	return config, nil
+}
+
+func (v *Volume) initReplication(cfg *ReplicationConfig) error {
+	v.replMtx.Lock()
+	defer v.replMtx.Unlock()
+	if cfg == nil || len(cfg.Rules) == 0 {
+		v.replicator = nil
+		return nil
+	}
+
+	clients := make(map[string]ObjectLayer)
+	if v.replicator != nil {
+		clients = v.replicator.Clients()
+	}
+
+	for _, rule := range cfg.Rules {
+		arn := fmt.Sprintf(ReplicationARNFormat, rule.Destination.Region, rule.Destination.Bucket)
+		if _, ok := clients[arn]; !ok {
+			client, err := NewS3Client(S3Config{
+				AccessKey: rule.Destination.AccessKey,
+				SecretKey: rule.Destination.SecretKey,
+				Region:    rule.Destination.Region,
+				Endpoint:  rule.Destination.ObjectAddr,
+			})
+			if err != nil {
+				return err
+			}
+			clients[arn] = client
+		}
+	}
+
+	if v.replicator == nil {
+		v.replicator = NewReplicator(v)
+	}
+	v.replicator.SetClients(clients)
+
+	return nil
 }
 
 func (v *Volume) getInodeFromPath(path string) (inode uint64, err error) {
@@ -675,7 +809,34 @@ func (v *Volume) PutObject(path string, reader io.Reader, opt *PutFileOption) (f
 	if oldInode != 0 && opt != nil && opt.ObjectLock != nil {
 		err = isObjectLocked(v, oldInode, lastPathItem.Name, path)
 		if err != nil {
+			log.LogErrorf("PutObject: object is locked: volume(%v) path(%v) inode(%v) err(%v)",
+				v.name, path, oldInode, err)
 			return
+		}
+	}
+
+	// check whether existing object is what we want
+	if oldInode > 0 && opt != nil && opt.PutTime > 0 {
+		var xAttrInfo *proto.XAttrInfo
+		if xAttrInfo, err = v.mw.XAttrGetAll_ll(oldInode); err != nil {
+			log.LogErrorf("PutObject: get object xAttr fail: volume(%v) path(%v) inode(%v) err(%v)",
+				v.name, path, oldInode, err)
+			return
+		}
+		if putTimeRaw := xAttrInfo.Get(XAttrKeyOSSPutTime); len(putTimeRaw) > 0 && opt.PutTime > 0 {
+			var putTime int64
+			if putTime, err = strconv.ParseInt(string(putTimeRaw), 10, 64); err != nil {
+				log.LogErrorf("PutObject: parse putTime fail: volume(%v) path(%v) putTime(%v) err(%v)",
+					v.name, path, putTimeRaw, err)
+				err = InvalidInternalPutTime
+				return
+			}
+			if putTime > opt.PutTime {
+				log.LogErrorf("PutObject: existing putTime newer: volume(%v) path(%v) actual(%v) receive(%v)",
+					v.name, path, putTime, opt.PutTime)
+				err = ObjectWithNewerPutTime
+				return
+			}
 		}
 	}
 
@@ -728,7 +889,7 @@ func (v *Volume) PutObject(path string, reader io.Reader, opt *PutFileOption) (f
 		if err = v.ec.Flush(invisibleTempDataInode.Inode); err != nil {
 			log.LogErrorf("PutObject: data flush inode fail: volume(%v) path(%v) inode(%v) err(%v)",
 				v.name, path, invisibleTempDataInode.Inode, err)
-			return nil, err
+			return
 		}
 	}
 
@@ -739,68 +900,61 @@ func (v *Volume) PutObject(path string, reader io.Reader, opt *PutFileOption) (f
 		return
 	}
 
+	// generate etag value
 	etagValue := ETagValue{
 		Value:   hex.EncodeToString(md5Hash.Sum(nil)),
 		PartNum: 0,
 		TS:      finalInode.ModifyTime,
 	}
+	etag := etagValue.ETag()
 
-	attr := &AttrItem{
-		XAttrInfo: proto.XAttrInfo{
-			Inode:  invisibleTempDataInode.Inode,
-			XAttrs: make(map[string]string),
-		},
+	// check whether uploading object is what we want
+	if opt != nil && opt.ETag != "" && opt.ETag != etag {
+		log.LogErrorf("PutObject: etag not match: volume(%v) path(%v) actual(%v) receive(%v)",
+			v.name, path, etag, opt.ETag)
+		err = BadDigestETag
+		return
 	}
 
-	attr.XAttrs[XAttrKeyOSSETag] = etagValue.Encode()
-	if opt != nil && opt.MIMEType != "" {
-		attr.XAttrs[XAttrKeyOSSMIME] = opt.MIMEType
-	}
-	if opt != nil && len(opt.Disposition) > 0 {
-		attr.XAttrs[XAttrKeyOSSDISPOSITION] = opt.Disposition
-	}
-	if opt != nil && opt.Tagging != nil {
-		attr.XAttrs[XAttrKeyOSSTagging] = opt.Tagging.Encode()
-	}
-	if opt != nil && len(opt.CacheControl) > 0 {
-		attr.XAttrs[XAttrKeyOSSCacheControl] = opt.CacheControl
-	}
-	if opt != nil && len(opt.Expires) > 0 {
-		attr.XAttrs[XAttrKeyOSSExpires] = opt.Expires
-	}
-	if opt != nil && opt.ACL != nil {
-		attr.XAttrs[XAttrKeyOSSACL] = opt.ACL.Encode()
-	}
+	// set object xattrs
+	xAttrs := opt.ToXAttrs()
+	xAttrs[XAttrKeyOSSETag] = etagValue.Encode()
 	if opt != nil && opt.ObjectLock != nil && opt.ObjectLock.ToRetention() != nil {
-		attr.XAttrs[XAttrKeyOSSLock] = formatRetentionDateStr(finalInode.ModifyTime, opt.ObjectLock.ToRetention())
+		xAttrs[XAttrKeyOSSLock] = formatRetentionDateStr(finalInode.ModifyTime, opt.ObjectLock.ToRetention())
 	}
-
-	// If user-defined metadata have been specified, use extend attributes for storage.
-	if opt != nil && len(opt.Metadata) > 0 {
-		for name, value := range opt.Metadata {
-			attr.XAttrs[name] = value
-			log.LogDebugf("PutObject: store user-defined metadata: "+
-				"volume(%v) path(%v) inode(%v) key(%v) value(%v)",
-				v.name, path, invisibleTempDataInode.Inode, name, value)
-		}
+	putTime := time.Now().UnixNano()
+	if opt != nil && opt.PutTime > 0 {
+		putTime = opt.PutTime
 	}
-
-	if err = v.mw.BatchSetXAttr_ll(invisibleTempDataInode.Inode, attr.XAttrs); err != nil {
+	xAttrs[XAttrKeyOSSPutTime] = fmt.Sprintf("%d", putTime)
+	if err = v.mw.BatchSetXAttr_ll(invisibleTempDataInode.Inode, xAttrs); err != nil {
 		log.LogErrorf("PutObject: BatchSetXAttr_ll fail: volume(%v) path(%v) inode(%v) attrs(%v) err(%v)",
-			v.name, path, invisibleTempDataInode.Inode, attr.XAttrs, err)
-		return nil, err
+			v.name, path, invisibleTempDataInode.Inode, xAttrs, err)
+		return
 	}
-	log.LogDebugf("PutObject: BatchSetXAttr_ll success: volume(%v) path(%v) inode(%v) attrs(%v)",
-		v.name, path, invisibleTempDataInode.Inode, attr.XAttrs)
+
 	// create file info
 	fsInfo = &FSFileInfo{
-		Path:       path,
-		Size:       int64(finalInode.Size),
-		Mode:       os.FileMode(finalInode.Mode),
-		CreateTime: finalInode.CreateTime,
-		ModifyTime: finalInode.ModifyTime,
-		ETag:       etagValue.ETag(),
-		Inode:      finalInode.Inode,
+		Path:         path,
+		Size:         int64(finalInode.Size),
+		Mode:         os.FileMode(finalInode.Mode),
+		CreateTime:   finalInode.CreateTime,
+		ModifyTime:   finalInode.ModifyTime,
+		Inode:        finalInode.Inode,
+		ACL:          xAttrs[XAttrKeyOSSACL],
+		CacheControl: xAttrs[XAttrKeyOSSCacheControl],
+		Disposition:  xAttrs[XAttrKeyOSSDISPOSITION],
+		ETag:         etag,
+		Expires:      xAttrs[XAttrKeyOSSExpires],
+		MIMEType:     xAttrs[XAttrKeyOSSMIME],
+		Tagging:      xAttrs[XAttrKeyOSSTagging],
+		PutTime:      putTime,
+		Metadata:     make(map[string]string),
+	}
+	for key, val := range xAttrs {
+		if !strings.HasPrefix(key, XAttrKeyOSSPrefix) {
+			fsInfo.Metadata[key] = val
+		}
 	}
 
 	// apply new inode to dentry
@@ -812,10 +966,16 @@ func (v *Volume) PutObject(path string, reader io.Reader, opt *PutFileOption) (f
 	}
 
 	// force updating dentry and attrs in cache
+	attr := &AttrItem{
+		XAttrInfo: proto.XAttrInfo{
+			Inode:  invisibleTempDataInode.Inode,
+			XAttrs: xAttrs,
+		},
+	}
 	updateDentryCache(parentId, invisibleTempDataInode.Inode, DefaultFileMode, lastPathItem.Name, v.name)
 	putAttrCache(attr, v.name)
 
-	return fsInfo, nil
+	return
 }
 
 func (v *Volume) applyInodeToDEntry(parentId uint64, name string, inode uint64, isCompleteMultipart bool, fullPath string) (err error) {
@@ -860,7 +1020,7 @@ func (v *Volume) applyInodeToDEntry(parentId uint64, name string, inode uint64, 
 // Notes:
 // This method will only returns internal system errors.
 // This method will not return syscall.ENOENT error
-func (v *Volume) DeletePath(path string) (err error) {
+func (v *Volume) DeletePath(path string, opt *DeleteFileOption) (info *FSFileInfo, err error) {
 	defer func() {
 		// Audit behavior
 		log.LogInfof("Audit: DeletePath: volume(%v) path(%v), err(%v)", v.name, path, err)
@@ -872,6 +1032,7 @@ func (v *Volume) DeletePath(path string) (err error) {
 			err = nil
 		}
 	}()
+
 	var parent uint64
 	var ino uint64
 	var name string
@@ -879,49 +1040,103 @@ func (v *Volume) DeletePath(path string) (err error) {
 	parent, ino, name, mode, err = v.recursiveLookupTarget(path, false)
 	if err != nil {
 		// An unexpected error occurred
+		log.LogErrorf("DeletePath: recursive lookup fail: volume(%v) path(%v) err(%v)", v.name, path, err)
 		return
 	}
-	log.LogDebugf("DeletePath: lookup target: path(%v) parentID(%v) inode(%v) name(%v) mode(%v)",
-		path, parent, ino, name, mode)
 	if mode.IsDir() {
 		// Check if the directory is empty and cannot delete non-empty directories.
 		var dentries []proto.Dentry
-		dentries, err = v.mw.ReadDirLimit_ll(ino, "", 1)
-		if err != nil || len(dentries) > 0 {
+		if dentries, err = v.mw.ReadDirLimit_ll(ino, "", 1); err != nil {
+			log.LogErrorf("DeletePath: read dir fail: volume(%v) path(%v) inode(%v) err(%v)",
+				v.name, path, ino, err)
+			return
+		}
+		if len(dentries) > 0 {
+			log.LogErrorf("DeletePath: dir not empty: volume(%v) path(%v) files(%v)", v.name, path, len(dentries))
+			err = AccessDenied
 			return
 		}
 	}
+
+	// get all xattrs
+	var xAttrs *proto.XAttrInfo
+	if xAttrs, err = v.mw.XAttrGetAll_ll(ino); err != nil {
+		log.LogErrorf("DeletePath: get inode xattr fail: volume(%v) path(%v) inode(%v) err(%v)",
+			v.name, path, ino, err)
+		return
+	}
+
+	// check whether object is what we want
+	var etag string
+	if etagRaw := xAttrs.Get(XAttrKeyOSSETag); len(etagRaw) > 0 {
+		etag = ParseETagValue(string(etagRaw)).ETag()
+	}
+	if opt != nil && opt.ETag != "" && opt.ETag != etag {
+		log.LogErrorf("DeletePath: etag not match: volume(%v) path(%v) inode(%v/%v) actual(%v) receive(%v)",
+			v.name, path, parent, ino, etag, opt.ETag)
+		err = BadDigestETag
+		return
+	}
+	var putTime int64
+	if putTimeRaw := xAttrs.Get(XAttrKeyOSSPutTime); len(putTimeRaw) > 0 {
+		if putTime, err = strconv.ParseInt(string(putTimeRaw), 10, 64); err == nil {
+			if opt != nil && opt.PutTime > 0 && opt.PutTime < putTime {
+				log.LogErrorf("DeletePath: existing putTime newer: volume(%v) path(%v) actual(%v) receive(%v)",
+					v.name, path, putTime, opt.PutTime)
+				err = ObjectWithNewerPutTime
+				return
+			}
+		}
+	}
+
 	// check whether object is protected by object lock
 	objetLock, err := v.metaLoader.loadObjectLock()
 	if err != nil {
 		log.LogErrorf("DeletePath: load volume objetLock: volume(%v) err(%v)", v.name, err)
 		return
 	}
-	log.LogInfof("DeletePath: delete: volume(%v) path(%v) inode(%v)", v.name, path, ino)
 
 	// delete dentry with condition when objectlock is open
+	var inoInfo *proto.InodeInfo
 	if objetLock != nil {
-		_, err = v.mw.DeleteWithCond_ll(parent, ino, name, mode.IsDir(), path)
+		inoInfo, err = v.mw.DeleteWithCond_ll(parent, ino, name, mode.IsDir(), path)
 	} else {
-		_, err = v.mw.Delete_ll(parent, name, mode.IsDir(), path)
+		inoInfo, err = v.mw.Delete_ll(parent, name, mode.IsDir(), path)
 	}
 	if err != nil {
+		log.LogErrorf("DeletePath: delete dentry fail: volume(%v) path(%v) parent(%v) name(%v) err(%v)",
+			v.name, path, parent, name, err)
 		return
 	}
 
+	// create file info
+	info = &FSFileInfo{
+		Path:       path,
+		Size:       int64(inoInfo.Size),
+		Mode:       mode,
+		CreateTime: inoInfo.CreateTime,
+		ModifyTime: inoInfo.ModifyTime,
+		Inode:      ino,
+		ETag:       etag,
+		PutTime:    putTime,
+	}
+
+	// evict stream
 	if err = v.ec.EvictStream(ino); err != nil {
-		log.LogWarnf("DeletePath EvictStream: path(%v) inode(%v)", path, ino)
+		log.LogWarnf("DeletePath: evict stream fail: volume(%v) path(%v) inode(%v) err(%v)",
+			v.name, path, ino, err)
 	}
 
 	// delete objectnode meta cache
 	deleteDentryCache(parent, name, v.name)
 	deleteAttrCache(parent, v.name)
 
-	log.LogInfof("DeletePath: evict: volume(%v) path(%v) inode(%v)", v.name, path, ino)
 	// Evict inode
 	if err = v.mw.Evict(ino, path); err != nil {
-		log.LogWarnf("DeletePath Evict: path(%v) inode(%v)", path, ino)
+		log.LogWarnf("DeletePath: evict inode fail: volume(%v) path(%v) inode(%v) err(%v)",
+			v.name, path, ino, err)
 	}
+
 	err = nil
 	return
 }
@@ -930,39 +1145,6 @@ func (v *Volume) InitMultipart(path string, opt *PutFileOption) (multipartID str
 	defer func() {
 		log.LogInfof("Audit: InitMultipart: volume(%v) path(%v) multipartID(%v) err(%v)", v.name, path, multipartID, err)
 	}()
-
-	extend := make(map[string]string)
-	// handle object system metadata, self-defined metadata, tagging
-	if opt != nil && opt.MIMEType != "" {
-		extend[XAttrKeyOSSMIME] = opt.MIMEType
-	}
-	// If request contain content-disposition header, store it to xattr
-	if opt != nil && len(opt.Disposition) > 0 {
-		extend[XAttrKeyOSSDISPOSITION] = opt.Disposition
-	}
-	// If request contain cache-control header, store it to xattr
-	if opt != nil && len(opt.CacheControl) > 0 {
-		extend[XAttrKeyOSSCacheControl] = opt.CacheControl
-	}
-	// If request contain expires header, store it to xattr
-	if opt != nil && len(opt.Expires) > 0 {
-		extend[XAttrKeyOSSExpires] = opt.Expires
-	}
-	// If user-defined metadata have been specified, use extend attributes for storage.
-	if opt != nil && len(opt.Metadata) > 0 {
-		for name, value := range opt.Metadata {
-			extend[name] = value
-		}
-	}
-	// If tagging have been specified, use extend attributes for storage.
-	if opt != nil && opt.Tagging != nil {
-		encoded := opt.Tagging.Encode()
-		extend[XAttrKeyOSSTagging] = encoded
-	}
-	// If ACL have been specified, use extend attributes for storage.
-	if opt != nil && opt.ACL != nil {
-		extend[XAttrKeyOSSACL] = opt.ACL.Encode()
-	}
 
 	if v.mw.EnableQuota {
 		var parentId uint64
@@ -978,11 +1160,12 @@ func (v *Volume) InitMultipart(path string, opt *PutFileOption) (multipartID str
 	}
 
 	// Iterate all the meta partition to create multipart id
-	multipartID, err = v.mw.InitMultipart_ll(path, extend)
+	multipartID, err = v.mw.InitMultipart_ll(path, opt.ToXAttrs())
 	if err != nil {
 		log.LogErrorf("InitMultipart: meta init multipart fail: path(%v) err(%v)", path, err)
 		return "", err
 	}
+
 	return multipartID, nil
 }
 
@@ -1143,6 +1326,7 @@ func (v *Volume) CompleteMultipart(path, multipartID string, multipartInfo *prot
 			v.name, path, multipartID, err)
 		return
 	}
+
 	// check file mode
 	oldInode, lookupMode, err := v.mw.Lookup_ll(parentId, filename)
 	if err != nil && err != syscall.ENOENT {
@@ -1156,6 +1340,7 @@ func (v *Volume) CompleteMultipart(path, multipartID string, multipartInfo *prot
 		err = syscall.EINVAL
 		return
 	}
+
 	// check whether object is protected by object lock
 	objectLock, err := v.metaLoader.loadObjectLock()
 	if err != nil {
@@ -1165,9 +1350,47 @@ func (v *Volume) CompleteMultipart(path, multipartID string, multipartInfo *prot
 	if oldInode != 0 && objectLock != nil {
 		err = isObjectLocked(v, oldInode, filename, path)
 		if err != nil {
+			log.LogErrorf("CompleteMultipart: object is locked: volume(%v) path(%v) inode(%v) err(%v)",
+				v.name, path, oldInode, err)
 			return
 		}
 	}
+
+	// check whether existing object is what we want
+	var initPutTime int64
+	if oldInode > 0 && multipartInfo != nil && multipartInfo.Extend != nil {
+		if initPutTimeRaw := multipartInfo.Extend[XAttrKeyOSSPutTime]; len(initPutTimeRaw) > 0 {
+			if initPutTime, err = strconv.ParseInt(initPutTimeRaw, 10, 64); err != nil {
+				log.LogErrorf("CompleteMultipart: parse init puttime fail: volume(%v) path(%v) multipartID(%v) putTime(%v) err(%v)",
+					v.name, path, multipartID, initPutTimeRaw, err)
+				err = InvalidInternalPutTime
+				return
+			}
+			var xAttrInfo *proto.XAttrInfo
+			if xAttrInfo, err = v.mw.XAttrGetAll_ll(oldInode); err != nil {
+				log.LogErrorf("CompleteMultipart: get object xAttr fail: volume(%v) path(%v) multipartID(%v) inode(%v) err(%v)",
+					v.name, path, multipartID, oldInode, err)
+				return
+			}
+			if oldPutTimeRaw := xAttrInfo.Get(XAttrKeyOSSPutTime); len(oldPutTimeRaw) > 0 {
+				var oldPutTime int64
+				if oldPutTime, err = strconv.ParseInt(string(oldPutTimeRaw), 10, 64); err != nil {
+					log.LogErrorf("CompleteMultipart: parse puttime fail: volume(%v) path(%v) multipartID(%v) inode(%v) putTime(%v) err(%v)",
+						v.name, path, multipartID, oldInode, oldPutTimeRaw, err)
+					err = InvalidInternalPutTime
+					return
+				}
+				if oldPutTime > initPutTime {
+					log.LogErrorf("CompleteMultipart: existing putTime newer: volume(%v) path(%v) multipartID(%v) old(%v) new(%v)",
+						v.name, path, multipartID, oldPutTime, initPutTime)
+					err = ObjectWithNewerPutTime
+					return
+				}
+			}
+		}
+	}
+
+	// sort parts
 	parts := multipartInfo.Parts
 	sort.SliceStable(parts, func(i, j int) bool { return parts[i].ID < parts[j].ID })
 
@@ -1178,8 +1401,6 @@ func (v *Volume) CompleteMultipart(path, multipartID string, multipartInfo *prot
 			v.name, path, multipartID, err)
 		return
 	}
-	log.LogDebugf("CompleteMultipart: meta inode create: volume(%v) path(%v) multipartID(%v) inode(%v)",
-		v.name, path, multipartID, completeInodeInfo.Inode)
 	defer func() {
 		if err != nil {
 			log.LogWarnf("CompleteMultipart: destroy inode: volume(%v) path(%v) multipartID(%v) inode(%v)",
@@ -1194,6 +1415,7 @@ func (v *Volume) CompleteMultipart(path, multipartID string, multipartInfo *prot
 	// merge complete extent keys
 	var size uint64
 	var fileOffset uint64
+	fsParts := make([]*FSPart, 0, len(parts))
 	if proto.IsCold(v.volType) {
 		completeObjExtentKeys := make([]proto.ObjExtentKey, 0)
 		for _, part := range parts {
@@ -1209,6 +1431,7 @@ func (v *Volume) CompleteMultipart(path, multipartID string, multipartInfo *prot
 				completeObjExtentKeys = append(completeObjExtentKeys, ek)
 			}
 			size += part.Size
+			fsParts = append(fsParts, &FSPart{PartNumber: int(part.ID), Size: int64(part.Size), ETag: part.MD5})
 		}
 		if err = v.mw.AppendObjExtentKeys(completeInodeInfo.Inode, completeObjExtentKeys); err != nil {
 			log.LogErrorf("CompleteMultipart: meta append extent keys fail: volume(%v) path(%v) multipartID(%v) inode(%v) err(%v)",
@@ -1231,6 +1454,7 @@ func (v *Volume) CompleteMultipart(path, multipartID string, multipartInfo *prot
 				completeExtentKeys = append(completeExtentKeys, ek)
 			}
 			size += part.Size
+			fsParts = append(fsParts, &FSPart{PartNumber: int(part.ID), Size: int64(part.Size), ETag: part.MD5})
 		}
 		if err = v.mw.AppendExtentKeys(completeInodeInfo.Inode, completeExtentKeys); err != nil {
 			log.LogErrorf("CompleteMultipart: meta append extent keys fail: volume(%v) path(%v) multipartID(%v) inode(%v) err(%v)",
@@ -1250,50 +1474,54 @@ func (v *Volume) CompleteMultipart(path, multipartID string, multipartInfo *prot
 		}
 		md5Val = hex.EncodeToString(md5Hash.Sum(nil))
 	}
-	log.LogDebugf("CompleteMultipart: merge parts: volume(%v) path(%v) multipartID(%v) numParts(%v) MD5(%v)",
-		v.name, path, multipartID, len(parts), md5Val)
 
 	var finalInode *proto.InodeInfo
 	if finalInode, err = v.mw.InodeGet_ll(completeInodeInfo.Inode); err != nil {
-		log.LogErrorf("CompleteMultipart: get inode fail: volume(%v) multipartID(%v) inode(%v) err(%v)",
-			v.name, multipartID, completeInodeInfo.Inode, err)
+		log.LogErrorf("CompleteMultipart: get inode fail: volume(%v) path(%v) multipartID(%v) inode(%v) err(%v)",
+			v.name, path, multipartID, completeInodeInfo.Inode, err)
 		return
 	}
 
+	// generate etag value
 	etagValue := ETagValue{
 		Value:   md5Val,
 		PartNum: len(parts),
 		TS:      finalInode.ModifyTime,
 	}
 
+	// check whether uploading object is what we want
+	etag := etagValue.ETag()
+	if initETag := multipartInfo.Extend[XAttrKeyOSSETag]; initETag != "" && initETag != etag {
+		log.LogErrorf("CompleteMultipart: init etag not match: volume(%v) path(%v) multipartID(%v) actual(%v) init(%v)",
+			v.name, path, multipartID, etag, initETag)
+		err = BadDigestETag
+		return
+	}
+
+	// set object xattrs
 	attrs := make(map[string]string)
-	attrItem := &AttrItem{
-		XAttrInfo: proto.XAttrInfo{
-			Inode:  completeInodeInfo.Inode,
-			XAttrs: attrs,
-		},
+	for key, value := range multipartInfo.Extend {
+		attrs[key] = value
 	}
 	attrs[XAttrKeyOSSETag] = etagValue.Encode()
-	// set user modified system metadata, self defined metadata and tag
-	extend := multipartInfo.Extend
-	if len(extend) > 0 {
-		for key, value := range extend {
-			attrs[key] = value
-		}
-	}
 	if objectLock != nil && objectLock.ToRetention() != nil {
 		attrs[XAttrKeyOSSLock] = formatRetentionDateStr(finalInode.ModifyTime, objectLock.ToRetention())
 	}
+	putTime := time.Now().UnixNano()
+	if initPutTime > 0 {
+		putTime = initPutTime
+	}
+	attrs[XAttrKeyOSSPutTime] = fmt.Sprintf("%d", putTime)
 	if err = v.mw.BatchSetXAttr_ll(finalInode.Inode, attrs); err != nil {
-		log.LogErrorf("CompleteMultipart: store multipart extend fail: volume(%v) multipartID(%v) inode(%v) "+
-			"attrs(%v) err(%v)", v.name, multipartID, finalInode.Inode, attrs, err)
-		return nil, err
+		log.LogErrorf("CompleteMultipart: batch set xattrs fail: volume(%v) path(%v) multipartID(%v) inode(%v) attrs(%v) err(%v)",
+			v.name, path, multipartID, finalInode.Inode, attrs, err)
+		return
 	}
 
 	// apply new inode to dentry
 	if err = v.applyInodeToDEntry(parentId, filename, completeInodeInfo.Inode, true, path); err != nil {
-		log.LogErrorf("CompleteMultipart: apply inode to dentry fail: volume(%v) multipartID(%v) parentId(%v) "+
-			"fileName(%v) inode(%v) err(%v)", v.name, multipartID, parentId, filename, completeInodeInfo.Inode, err)
+		log.LogErrorf("CompleteMultipart: apply inode to dentry fail: volume(%v) path(%v) multipartID(%v) parentId(%v) name(%v) inode(%v) err(%v)",
+			v.name, path, multipartID, parentId, filename, completeInodeInfo.Inode, err)
 		return
 	}
 
@@ -1327,23 +1555,41 @@ func (v *Volume) CompleteMultipart(path, multipartID string, multipartInfo *prot
 	}()
 
 	// force updating dentry and attrs in cache
+	attrItem := &AttrItem{
+		XAttrInfo: proto.XAttrInfo{
+			Inode:  completeInodeInfo.Inode,
+			XAttrs: attrs,
+		},
+	}
 	updateDentryCache(parentId, completeInodeInfo.Inode, DefaultFileMode, filename, v.name)
 	putAttrCache(attrItem, v.name)
 
-	log.LogDebugf("CompleteMultipart: meta complete multipart: volume(%v) multipartID(%v) path(%v) parentID(%v) inode(%v) etagValue(%v)",
-		v.name, multipartID, path, parentId, finalInode.Inode, etagValue)
 	// create file info
-	fInfo := &FSFileInfo{
-		Path:       path,
-		Size:       int64(size),
-		Mode:       os.FileMode(DefaultFileMode),
-		CreateTime: time.Now(),
-		ModifyTime: time.Now(),
-		ETag:       etagValue.ETag(),
-		Inode:      finalInode.Inode,
+	fsFileInfo = &FSFileInfo{
+		Path:         path,
+		Size:         int64(size),
+		Mode:         os.FileMode(DefaultFileMode),
+		CreateTime:   finalInode.CreateTime,
+		ModifyTime:   finalInode.ModifyTime,
+		Inode:        finalInode.Inode,
+		ACL:          attrs[XAttrKeyOSSACL],
+		CacheControl: attrs[XAttrKeyOSSCacheControl],
+		Disposition:  attrs[XAttrKeyOSSDISPOSITION],
+		ETag:         etag,
+		Expires:      attrs[XAttrKeyOSSExpires],
+		MIMEType:     attrs[XAttrKeyOSSMIME],
+		Tagging:      attrs[XAttrKeyOSSTagging],
+		PutTime:      putTime,
+		Metadata:     make(map[string]string),
+		Parts:        fsParts,
+	}
+	for key, val := range attrs {
+		if !strings.HasPrefix(key, XAttrKeyOSSPrefix) {
+			fsFileInfo.Metadata[key] = val
+		}
 	}
 
-	return fInfo, nil
+	return
 }
 
 func (v *Volume) ebsWrite(inode uint64, reader io.Reader, h hash.Hash) (size uint64, err error) {
@@ -1693,6 +1939,9 @@ func (v *Volume) ObjectMeta(path string) (info *FSFileInfo, xattr *proto.XAttrIn
 		disposition  string
 		cacheControl string
 		expires      string
+		acl          string
+		tagging      string
+		putTime      int64
 	)
 
 	if objMetaCache != nil {
@@ -1738,12 +1987,21 @@ func (v *Volume) ObjectMeta(path string) (info *FSFileInfo, xattr *proto.XAttrIn
 		disposition = string(xattr.Get(XAttrKeyOSSDISPOSITION))
 		cacheControl = string(xattr.Get(XAttrKeyOSSCacheControl))
 		expires = string(xattr.Get(XAttrKeyOSSExpires))
-		rawETag := string(xattr.Get(XAttrKeyOSSETag))
+		tagging = string(xattr.Get(XAttrKeyOSSTagging))
+		acl = string(xattr.Get(XAttrKeyOSSACL))
+		var rawETag = string(xattr.Get(XAttrKeyOSSETag))
 		if len(rawETag) == 0 {
 			rawETag = string(xattr.Get(XAttrKeyOSSETagDeprecated))
 		}
 		if len(rawETag) > 0 {
 			etagValue = ParseETagValue(rawETag)
+		}
+		if putTimeRaw := xattr.Get(XAttrKeyOSSPutTime); len(putTimeRaw) > 0 {
+			if putTime, err = strconv.ParseInt(string(putTimeRaw), 10, 64); err != nil {
+				log.LogErrorf("getObjectMeta: parse putTime fail: volume(%v) path(%v) putTime(%v) err(%v)",
+					v.Name(), path, string(putTimeRaw), err)
+				return
+			}
 		}
 	}
 	// Load user-defined metadata
@@ -1766,8 +2024,8 @@ func (v *Volume) ObjectMeta(path string) (info *FSFileInfo, xattr *proto.XAttrIn
 	}
 
 	// Validating ETag value.
-	if !mode.IsDir() && (!etagValue.Valid() || etagValue.TS.Before(inoInfo.ModifyTime)) {
-		log.LogWarnf("ObjectMeta: etag invalid or before inode modTime: volume(%v) path(%v) inoInfo(%v) etagVal(%v)",
+	if !mode.IsDir() && !etagValue.Valid() {
+		log.LogWarnf("ObjectMeta: invalid etag: volume(%v) path(%v) inoInfo(%+v) etagVal(%+v)",
 			v.name, path, inoInfo, etagValue)
 	}
 
@@ -1777,16 +2035,88 @@ func (v *Volume) ObjectMeta(path string) (info *FSFileInfo, xattr *proto.XAttrIn
 		Mode:            os.FileMode(inoInfo.Mode),
 		CreateTime:      inoInfo.CreateTime,
 		ModifyTime:      inoInfo.ModifyTime,
-		ETag:            etagValue.ETag(),
 		Inode:           inoInfo.Inode,
+		ACL:             acl,
 		MIMEType:        mimeType,
 		Disposition:     disposition,
 		CacheControl:    cacheControl,
+		ETag:            etagValue.ETag(),
 		Expires:         expires,
+		Tagging:         tagging,
 		Metadata:        metadata,
+		PutTime:         putTime,
 		RetainUntilDate: retainUntilDate,
 	}
+
 	return
+}
+
+func (v *Volume) ObjectReplication(info *FSFileInfo, file File, opts ReplicationOptions) {
+	if sysSyncReplication {
+		v.objectReplication(info, file, opts)
+		return
+	}
+	go v.objectReplication(info, file, opts)
+}
+
+func (v *Volume) objectReplication(info *FSFileInfo, file File, opts ReplicationOptions) {
+	if file != nil {
+		defer file.Close()
+		if _, err := file.Seek(0, 0); err != nil {
+			panic(fmt.Sprintf("ObjectReplication: seek file fail: requestID(%v) volume(%v) err(%v)",
+				opts.RequestID, v.Name(), err))
+		}
+	}
+
+	if info != nil {
+		if info.Mode == DefaultDirMode || opts.ReplicationRequest || !opts.OpType.IsValid() {
+			return
+		}
+
+		config, err := v.metaLoader.loadReplication()
+		if err != nil {
+			log.LogErrorf("ObjectReplication: replication load fail: requestID(%v) volume(%v) err(%v)",
+				opts.RequestID, v.name, err)
+			return
+		}
+		if config == nil || len(config.Rules) == 0 {
+			log.LogDebugf("ObjectReplication: no configuration replication: requestID(%v) volume(%v)",
+				opts.RequestID, v.name)
+			return
+		}
+
+		v.replMtx.RLock()
+		replicator := v.replicator
+		v.replMtx.RUnlock()
+		if replicator == nil {
+			panic(fmt.Sprintf("ObjectReplication: replicator is nil but configured: requestID(%v) volume(%v)",
+				opts.RequestID, v.name))
+		}
+
+		var wg sync.WaitGroup
+		for arn, dest := range config.Filter(info.Path, opts.OpType) {
+			rpInfo := ReplicationInfo{
+				ARN:                arn,
+				Bucket:             dest.Bucket,
+				FileInfo:           info,
+				ReplicationOptions: opts,
+			}
+			if file != nil {
+				rpInfo.Reader = &ReaderAt{ReaderAt: file}
+			}
+
+			wg.Add(1)
+			go func(bkt string) {
+				defer wg.Done()
+				if err = replicator.Schedule(rpInfo); err != nil {
+					log.LogErrorf("ObjectReplication: replicator schedule fail: requestID(%v) source(%v) target(%v) info(%+v) err(%v)",
+						opts.RequestID, v.name, bkt, rpInfo, err)
+				}
+				// todo: send event notification
+			}(dest.Bucket)
+		}
+		wg.Wait()
+	}
 }
 
 func (v *Volume) Close() error {
@@ -1896,6 +2226,8 @@ func (v *Volume) recursiveLookupTarget(path string, notUseCache bool) (parent ui
 			return
 		}
 		if err == syscall.ENOENT {
+			log.LogErrorf("recursiveLookupPath: lookup fail, parentID(%v) name(%v) err(%v)",
+				parent, pathItem.Name, err)
 			deleteDentryCache(parent, pathItem.Name, v.name)
 			return
 		}
@@ -1907,6 +2239,8 @@ func (v *Volume) recursiveLookupTarget(path string, notUseCache bool) (parent ui
 			parent, curIno, pathItem.Name, os.FileMode(curMode))
 		// Check file mode
 		if os.FileMode(curMode).IsDir() != pathItem.IsDirectory {
+			log.LogErrorf("recursiveLookupPath: invalid file mode: parentID(%v) name(%v) isDir(%v)",
+				parent, pathItem.Name, pathItem.IsDirectory)
 			err = syscall.ENOENT
 			return
 		}
@@ -2566,7 +2900,7 @@ func (v *Volume) ListParts(path, uploadId string, maxParts, partNumberMarker uin
 			PartNumber:   int(sessionPart.ID),
 			LastModified: formatTimeISO(sessionPart.UploadTime),
 			ETag:         sessionPart.MD5,
-			Size:         int(sessionPart.Size),
+			Size:         int64(sessionPart.Size),
 		}
 		parts = append(parts, fsPart)
 	}
@@ -2588,6 +2922,7 @@ func (v *Volume) CopyFile(sv *Volume, sourcePath, targetPath, metaDirective stri
 		sInodeInfo *proto.InodeInfo
 	)
 
+	// source file check
 	if _, sInode, sName, sMode, err = sv.recursiveLookupTarget(sourcePath, false); err != nil {
 		log.LogErrorf("CopyFile: look up source path fail, source path(%v) err(%v)", sourcePath, err)
 		return
@@ -2624,57 +2959,37 @@ func (v *Volume) CopyFile(sv *Volume, sourcePath, targetPath, metaDirective stri
 			if opt != nil && opt.ObjectLock != nil {
 				err = isObjectLocked(v, sInode, sName, sourcePath)
 				if err != nil {
+					log.LogErrorf("CopyFile: object is locked: volume(%v) path(%v) inode(%v) err(%v)",
+						v.name, sourcePath, sInode, err)
 					return
 				}
 			}
-			// replace system metadata : 'Content-Type' and 'Content-Disposition', if user specified, replace user defined metadata
-			// If MIME information is valid, use extended attributes for storage.
+
+			// replace system metadata
+			xAttrs := opt.ToXAttrs()
+			if opt != nil && opt.ObjectLock != nil && opt.ObjectLock.ToRetention() != nil {
+				xAttrs[XAttrKeyOSSLock] = formatRetentionDateStr(time.Now(), opt.ObjectLock.ToRetention())
+			}
+			if err = v.mw.BatchSetXAttr_ll(sInode, xAttrs); err != nil {
+				log.LogErrorf("CopyFile: BatchSetXAttr_ll fail: volume(%v) path(%v) inode(%v) attrs(%v) err(%v)",
+					sv.name, sourcePath, sInode, xAttrs, err)
+				return
+			}
+
+			// update attrs in cache
 			attr := &AttrItem{
 				XAttrInfo: proto.XAttrInfo{
 					Inode:  sInode,
-					XAttrs: make(map[string]string),
+					XAttrs: xAttrs,
 				},
 			}
-			if opt != nil && opt.MIMEType != "" {
-				attr.XAttrs[XAttrKeyOSSMIME] = opt.MIMEType
-			}
-			if opt != nil && opt.Disposition != "" {
-				attr.XAttrs[XAttrKeyOSSDISPOSITION] = opt.Disposition
-			}
-			if opt != nil && opt.CacheControl != "" {
-				attr.XAttrs[XAttrKeyOSSCacheControl] = opt.CacheControl
-			}
-			if opt != nil && opt.Expires != "" {
-				attr.XAttrs[XAttrKeyOSSExpires] = opt.Expires
-			}
-			if opt != nil && opt.ACL != nil {
-				attr.XAttrs[XAttrKeyOSSACL] = opt.ACL.Encode()
-			}
-			if opt != nil && opt.ObjectLock != nil && opt.ObjectLock.ToRetention() != nil {
-				attr.XAttrs[XAttrKeyOSSLock] = formatRetentionDateStr(time.Now(), opt.ObjectLock.ToRetention())
-			}
-			// If user-defined metadata have been specified, use extend attributes for storage.
-			if opt != nil && len(opt.Metadata) > 0 {
-				for name, value := range opt.Metadata {
-					attr.XAttrs[name] = value
-					log.LogDebugf("PutObject: store user-defined metadata: "+
-						"volume(%v) path(%v) inode(%v) key(%v) value(%v)",
-						sv.name, sourcePath, sInode, name, value)
-				}
-			}
-			if err = v.mw.BatchSetXAttr_ll(sInode, attr.XAttrs); err != nil {
-				log.LogErrorf("CopyFile: BatchSetXAttr_ll fail: volume(%v) source path(%v) inode(%v) attrs(%v) err(%v)",
-					sv.name, sourcePath, sInode, attr.XAttrs, err)
-				return nil, err
-			}
-			// merge attrs in cache
-			if objMetaCache != nil {
-				objMetaCache.MergeAttr(v.name, attr)
-			}
+			putAttrCache(attr, v.name)
 			log.LogInfof("CopyFile: target path is equal with source path, replace metadata, source path(%v) target path(%v) opt(%v)",
 				sourcePath, targetPath, opt)
 		}
+
 		info, xattr, err = sv.ObjectMeta(sourcePath)
+
 		return info, err
 	}
 
@@ -2697,6 +3012,7 @@ func (v *Volume) CopyFile(sv *Volume, sourcePath, targetPath, metaDirective stri
 			"target path(%v), target inode(%v), source path(%v), source inode(%v)", targetPath, oldtInode, sourcePath, sInode)
 		return nil, syscall.EINVAL
 	}
+
 	// if source file mode is directory, return OK, and need't create target directory
 	if sMode == DefaultDirMode {
 		// create target directory
@@ -2713,6 +3029,7 @@ func (v *Volume) CopyFile(sv *Volume, sourcePath, targetPath, metaDirective stri
 				v.name, targetPath, err)
 			return
 		}
+
 		info = &FSFileInfo{
 			Path:       targetPath,
 			Size:       0,
@@ -2723,8 +3040,10 @@ func (v *Volume) CopyFile(sv *Volume, sourcePath, targetPath, metaDirective stri
 			Inode:      tInodeInfo.Inode,
 			MIMEType:   ValueContentTypeDirectory,
 		}
+
 		return info, nil
 	}
+
 	// recursive create target directory, and get parent id and last name
 	if tParentId, err = v.recursiveMakeDirectory(targetPath); err != nil {
 		log.LogErrorf("CopyFile: recursive make target path directory fail: volume(%v) path(%v) err(%v)",
@@ -2743,6 +3062,8 @@ func (v *Volume) CopyFile(sv *Volume, sourcePath, targetPath, metaDirective stri
 	if oldtInode != 0 && opt != nil && opt.ObjectLock != nil {
 		err = isObjectLocked(v, oldtInode, tLastName, targetPath)
 		if err != nil {
+			log.LogErrorf("CopyFile: object is locked: volume(%v) path(%v) inode(%v) err(%v)",
+				v.name, targetPath, oldtInode, err)
 			return
 		}
 	}
@@ -2762,6 +3083,8 @@ func (v *Volume) CopyFile(sv *Volume, sourcePath, targetPath, metaDirective stri
 			_ = v.mw.Evict(tInodeInfo.Inode, targetPath)
 		}
 	}()
+
+	// open target file inode to write
 	if err = v.ec.OpenStream(tInodeInfo.Inode); err != nil {
 		return
 	}
@@ -2839,19 +3162,17 @@ func (v *Volume) CopyFile(sv *Volume, sourcePath, targetPath, metaDirective stri
 			break
 		}
 	}
+
 	// flush
 	if proto.IsCold(v.volType) {
 		err = ebsWriter.FlushWithoutPool(tInodeInfo.Inode, tctx)
 	} else {
-		v.ec.Flush(tInodeInfo.Inode)
+		err = v.ec.Flush(tInodeInfo.Inode)
 	}
 	if err != nil {
 		log.LogErrorf("CopyFile: data flush inode fail, volume(%v) inode(%v), path (%v) err(%v)", v.name, tInodeInfo.Inode, targetPath, err)
 		return
 	}
-
-	md5Value = hex.EncodeToString(md5Hash.Sum(nil))
-	log.LogDebugf("Audit: copy file: write file finished, volume(%v), path(%v), etag(%v)", v.name, targetPath, md5Value)
 
 	var finalInode *proto.InodeInfo
 	if finalInode, err = v.mw.InodeGet_ll(tInodeInfo.Inode); err != nil {
@@ -2859,108 +3180,98 @@ func (v *Volume) CopyFile(sv *Volume, sourcePath, targetPath, metaDirective stri
 			v.name, targetPath, tInodeInfo.Inode, err)
 		return
 	}
+
+	// generate etag value
+	md5Value = hex.EncodeToString(md5Hash.Sum(nil))
 	etagValue := ETagValue{
 		Value:   md5Value,
 		PartNum: 0,
 		TS:      finalInode.ModifyTime,
 	}
 
-	targetAttr := &AttrItem{
-		XAttrInfo: proto.XAttrInfo{
-			Inode:  tInodeInfo.Inode,
-			XAttrs: make(map[string]string),
-		},
-	}
-	targetAttr.XAttrs[XAttrKeyOSSETag] = etagValue.Encode()
-
 	// copy source file metadata to write target file metadata
+	xAttrs := opt.ToXAttrs()
 	if metaDirective != MetadataDirectiveReplace {
+		// copy source xattrs
 		xattr, err = sv.mw.XAttrGetAll_ll(sInode)
 		if xattr == nil || err != nil {
+			log.LogErrorf("CopyFile: source xattrs are empty or fail: volume(%v) path(%v) inode(%v) err(%v)",
+				sv.name, sourcePath, sInode, err)
 			return
 		}
+
+		filteredKeys := map[string]struct{}{
+			XAttrKeyOSSETag: {},
+			XAttrKeyOSSLock: {},
+			XAttrKeyOSSACL:  {},
+		}
+		xAttrs = make(map[string]string)
 		for key, val := range xattr.XAttrs {
-			if key == XAttrKeyOSSETag {
+			if _, ok := filteredKeys[key]; ok {
 				continue
 			}
-			targetAttr.XAttrs[key] = val
+			xAttrs[key] = val
 		}
-		if opt != nil && opt.ACL != nil {
-			targetAttr.XAttrs[XAttrKeyOSSACL] = opt.ACL.Encode()
-		}
-		if opt != nil && opt.ObjectLock != nil && opt.ObjectLock.ToRetention() != nil {
-			targetAttr.XAttrs[XAttrKeyOSSLock] = formatRetentionDateStr(tInodeInfo.ModifyTime, opt.ObjectLock.ToRetention())
-		}
-		if err = v.mw.BatchSetXAttr_ll(tInodeInfo.Inode, targetAttr.XAttrs); err != nil {
-			log.LogErrorf("CopyFile: set target xattr fail: volume(%v) target path(%v) inode(%v) xattr (%v)err(%v)",
-				v.name, targetPath, tInodeInfo.Inode, xattr, err)
-			return
-		}
-		// merge attrs in cache
-		if objMetaCache != nil {
-			objMetaCache.PutAttr(v.name, targetAttr)
-		}
-	} else {
-		log.LogDebugf("debug_CopyFile replace dst meta")
-		if opt != nil && opt.MIMEType != "" {
-			targetAttr.XAttrs[XAttrKeyOSSMIME] = opt.MIMEType
-		}
-		if opt != nil && opt.Disposition != "" {
-			targetAttr.XAttrs[XAttrKeyOSSDISPOSITION] = opt.Disposition
-		}
-		if opt != nil && opt.CacheControl != "" {
-			targetAttr.XAttrs[XAttrKeyOSSCacheControl] = opt.CacheControl
-		}
-		if opt != nil && opt.Expires != "" {
-			targetAttr.XAttrs[XAttrKeyOSSExpires] = opt.Expires
-		}
-		if opt != nil && opt.ACL != nil {
-			targetAttr.XAttrs[XAttrKeyOSSACL] = opt.ACL.Encode()
-		}
-		if opt != nil && opt.ObjectLock != nil && opt.ObjectLock.ToRetention() != nil {
-			targetAttr.XAttrs[XAttrKeyOSSLock] = formatRetentionDateStr(tInodeInfo.ModifyTime, opt.ObjectLock.ToRetention())
-		}
-
-		// If user-defined metadata have been specified, use extend attributes for storage.
-		if opt != nil && len(opt.Metadata) > 0 {
-			for name, value := range opt.Metadata {
-				targetAttr.XAttrs[name] = value
-				log.LogDebugf("CopyFile: store user-defined metadata: "+
-					"volume(%v) path(%v) inode(%v) key(%v) value(%v)",
-					v.name, targetPath, tInodeInfo.Inode, name, value)
-			}
-		}
-
-		if err = v.mw.BatchSetXAttr_ll(tInodeInfo.Inode, targetAttr.XAttrs); err != nil {
-			log.LogErrorf("CopyFile: BatchSetXAttr_ll fail: volume(%v) target path(%v) inode(%v) attrs(%v) err(%v)",
-				v.name, targetPath, tInodeInfo.Inode, targetAttr.XAttrs, err)
-			return nil, err
-		}
-		// merge attrs in cache
-		if objMetaCache != nil {
-			objMetaCache.PutAttr(v.name, targetAttr)
+		if opt != nil && opt.ACL != "" {
+			xAttrs[XAttrKeyOSSACL] = opt.ACL
 		}
 	}
+	xAttrs[XAttrKeyOSSETag] = etagValue.Encode()
+	if opt != nil && opt.ObjectLock != nil && opt.ObjectLock.ToRetention() != nil {
+		xAttrs[XAttrKeyOSSLock] = formatRetentionDateStr(tInodeInfo.ModifyTime, opt.ObjectLock.ToRetention())
+	}
+	putTime := time.Now().UnixNano()
+	if opt != nil && opt.PutTime > 0 {
+		putTime = opt.PutTime
+	}
+	xAttrs[XAttrKeyOSSPutTime] = fmt.Sprintf("%d", putTime)
 
-	// create file info
-	info = &FSFileInfo{
-		Path:       targetPath,
-		Size:       int64(fileSize),
-		Mode:       sMode,
-		ModifyTime: tInodeInfo.ModifyTime,
-		CreateTime: tInodeInfo.CreateTime,
-		ETag:       md5Value,
-		Inode:      tInodeInfo.Inode,
+	// batch set xattrs
+	if err = v.mw.BatchSetXAttr_ll(tInodeInfo.Inode, xAttrs); err != nil {
+		log.LogErrorf("CopyFile: batch set attrs fail: volume(%v) path(%v) inode(%v) attrs(%v) err(%v)",
+			v.name, targetPath, tInodeInfo.Inode, xAttrs, err)
+		return
 	}
 
 	// apply new inode to dentry
 	err = v.applyInodeToDEntry(tParentId, tLastName, tInodeInfo.Inode, false, targetPath)
 	if err != nil {
-		log.LogErrorf("CopyFile: apply inode to new dentry fail: path(%v) parentID(%v) name(%v) inode(%v) err(%v)",
-			targetPath, tParentId, tLastName, tInodeInfo.Inode, err)
+		log.LogErrorf("CopyFile: apply inode to dentry fail: volume(%v) path(%v) parentID(%v) name(%v) inode(%v) err(%v)",
+			v.name, targetPath, tParentId, tLastName, tInodeInfo.Inode, err)
+		return
+	}
+
+	// create file info
+	info = &FSFileInfo{
+		Path:         targetPath,
+		Size:         int64(fileSize),
+		Mode:         sMode,
+		CreateTime:   tInodeInfo.CreateTime,
+		ModifyTime:   tInodeInfo.ModifyTime,
+		Inode:        tInodeInfo.Inode,
+		ACL:          xAttrs[XAttrKeyOSSACL],
+		CacheControl: xAttrs[XAttrKeyOSSCacheControl],
+		Disposition:  xAttrs[XAttrKeyOSSDISPOSITION],
+		ETag:         md5Value,
+		Expires:      xAttrs[XAttrKeyOSSExpires],
+		MIMEType:     xAttrs[XAttrKeyOSSMIME],
+		Tagging:      xAttrs[XAttrKeyOSSTagging],
+		PutTime:      putTime,
+		Metadata:     make(map[string]string),
+	}
+	for key, val := range xAttrs {
+		if !strings.HasPrefix(key, XAttrKeyOSSPrefix) {
+			info.Metadata[key] = val
+		}
 	}
 
 	// force updating dentry and attrs in cache
+	targetAttr := &AttrItem{
+		XAttrInfo: proto.XAttrInfo{
+			Inode:  tInodeInfo.Inode,
+			XAttrs: xAttrs,
+		},
+	}
 	updateDentryCache(tParentId, tInodeInfo.Inode, DefaultFileMode, tLastName, v.name)
 	putAttrCache(targetAttr, v.name)
 
@@ -3038,6 +3349,7 @@ func NewVolume(config *VolumeConfig) (*Volume, error) {
 	}
 
 	v := &Volume{
+		mc:             mc,
 		mw:             metaWrapper,
 		ec:             extentClient,
 		name:           config.Volume,

@@ -21,19 +21,24 @@ import (
 )
 
 type FSFileInfo struct {
-	Path            string
-	Size            int64
-	Mode            os.FileMode
-	ModifyTime      time.Time
-	CreateTime      time.Time
-	ETag            string
-	Inode           uint64
-	MIMEType        string
-	Disposition     string
+	Path       string
+	Size       int64
+	Mode       os.FileMode
+	ModifyTime time.Time
+	CreateTime time.Time
+	Inode      uint64
+
+	ACL             string
 	CacheControl    string
+	Disposition     string
+	ETag            string
 	Expires         string
+	MIMEType        string
 	Metadata        map[string]string `graphql:"-"` // User-defined metadata
+	PutTime         int64
 	RetainUntilDate string
+	Tagging         string
+	Parts           []*FSPart
 }
 
 type Prefixes []string
@@ -71,5 +76,5 @@ type FSPart struct {
 	PartNumber   int
 	LastModified string
 	ETag         string
-	Size         int
+	Size         int64
 }

@@ -145,3 +145,8 @@ func ParseETagValue(raw string) ETagValue {
 	}
 	return value
 }
+
+func DecodeETagHex(etag string) []byte {
+	bytes, _ := hex.DecodeString(etag)
+	return bytes
+}

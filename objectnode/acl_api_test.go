@@ -15,6 +15,7 @@
 package objectnode
 
 import (
+	"encoding/base64"
 	"encoding/xml"
 	"net/http"
 	"strings"
@@ -421,4 +422,62 @@ func TestConflictAcl(t *testing.T) {
 	req.Header.Set("x-amz-acl", "public-read")
 	_, err = ParseACL(req, "user", false, false)
 	require.EqualError(t, err, ErrConflictAclHeader.Error())
+}
+
+func TestParseACLFromByte(t *testing.T) {
+	aclExample := `<AccessControlPolicy>
+    <Owner>
+        <ID>user</ID>
+    </Owner>
+    <AccessControlList>
+		<Grant>
+			<Grantee xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="Group">
+				<URI>http://acs.amazonaws.com/groups/global/AllUsers</URI>
+			</Grantee>
+			<Permission>READ</Permission>
+		</Grant>
+    </AccessControlList>
+</AccessControlPolicy>`
+	acl, err := ParseACLFromByte([]byte(aclExample))
+	require.NoError(t, err)
+	aclBytes, err := acl.Encode()
+	require.NoError(t, err)
+	_, err = ParseACLFromByte(aclBytes)
+	require.NoError(t, err)
+}
+
+func TestParseRequestACL(t *testing.T) {
+	aclExample := `<AccessControlPolicy>
+    <Owner>
+        <ID>user</ID>
+    </Owner>
+    <AccessControlList>
+		<Grant>
+			<Grantee xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="Group">
+				<URI>http://acs.amazonaws.com/groups/global/AllUsers</URI>
+			</Grantee>
+			<Permission>READ</Permission>
+		</Grant>
+    </AccessControlList>
+</AccessControlPolicy>`
+	// only s3 acl
+	req, _ := http.NewRequest("PUT", "http://bucket.s3.com?acl", strings.NewReader(aclExample))
+	req.ContentLength = int64(len(aclExample))
+	aclBytes, err := ParseRequestACL(req, "user", true, false)
+	require.NoError(t, err)
+
+	// with x-cfs-source-acl, s3 acl will be ignored
+	req, _ = http.NewRequest("PUT", "http://bucket.s3.com?acl", strings.NewReader(aclExample))
+	req.ContentLength = int64(len(aclExample))
+	req.Header.Set(XCfsSourceAcl, base64.StdEncoding.EncodeToString(aclBytes))
+	newAclBytes, err := ParseRequestACL(req, "user", true, false)
+	require.NoError(t, err)
+	require.Equal(t, aclBytes, newAclBytes)
+
+	// source acl not base64 encoded
+	req, _ = http.NewRequest("PUT", "http://bucket.s3.com?acl", strings.NewReader(aclExample))
+	req.ContentLength = int64(len(aclExample))
+	req.Header.Set(XCfsSourceAcl, string(aclBytes))
+	_, err = ParseRequestACL(req, "user", true, false)
+	require.ErrorAs(t, err, &InvalidSourceACL)
 }

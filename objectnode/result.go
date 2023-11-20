@@ -130,7 +130,7 @@ type Part struct {
 	PartNumber   int      `xml:"PartNumber"`
 	LastModified string   `xml:"LastModified"`
 	ETag         string   `xml:"ETag"`
-	Size         int      `xml:"Size"`
+	Size         int64    `xml:"Size"`
 }
 
 type ListPartsResult struct {

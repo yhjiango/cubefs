@@ -36,6 +36,7 @@ import (
 	"github.com/cubefs/cubefs/sdk/master"
 	"github.com/cubefs/cubefs/util/config"
 	"github.com/cubefs/cubefs/util/exporter"
+	"github.com/cubefs/cubefs/util/flowctrl"
 	"github.com/cubefs/cubefs/util/log"
 	"github.com/cubefs/cubefs/util/reloadconf"
 
@@ -128,6 +129,28 @@ const (
 	// 		}
 	configAuditLog = "auditLog"
 
+	// Bool type configuration item, used to enable forced writing of temp file when uploading objects.
+	// Example:
+	//		{
+	//			"enableForceWriteFile": true
+	//		}
+	configForceWriteFile = "enableForceWriteFile"
+
+	// Integer type configuration item, used to configure the threshold for writing data to a temporary file
+	// when uploading objects, in bytes.
+	// Example:
+	//		{
+	//			"file_max_mem": 10485760
+	//		}
+	configFileMaxMemory = "file_max_mem"
+
+	// Integer type configuration item, used to configure the rate of writing files.
+	// Example:
+	//		{
+	//			"file_write_mbps": 10
+	//		}
+	configFileWriteMBps = "file_write_mbps"
+
 	// ObjMetaCache takes each path hierarchy of the path-like S3 object key as the cache key,
 	// and map it to the corresponding posix-compatible inode
 	// when enabled, the maxDentryCacheNum must at least be the minimum of defaultMaxDentryCacheNum
@@ -136,6 +159,7 @@ const (
 	//			"enableObjMetaCache": true
 	//		}
 	configObjMetaCache = "enableObjMetaCache"
+
 	// Example:
 	//		{
 	//			"cacheRefreshIntervalSec": 600
@@ -148,12 +172,16 @@ const (
 
 	// enable block cache when reading data in cold volume
 	enableBcache = "enableBcache"
+
 	// define thread numbers for writing and reading ebs
 	ebsWriteThreads = "bStoreWriteThreads"
 	ebsReadThreads  = "bStoreReadThreads"
 
 	// s3 QoS config refresh interval
 	s3QoSRefreshIntervalSec = "s3QoSRefreshIntervalSec"
+
+	// enable sync replication
+	configSyncReplication = "enableSyncReplication"
 )
 
 // Default of configuration value
@@ -180,6 +208,13 @@ var (
 	enableBlockcache bool
 )
 
+var (
+	sysFileWriteBps    int
+	sysForceWriteFile  = false
+	sysSyncReplication = false
+	sysFileMaxMem      = int64(10 << 20)
+)
+
 type ObjectNode struct {
 	domains    []string
 	wildcards  Wildcards
@@ -202,6 +237,7 @@ type ObjectNode struct {
 	stsNotAllowedActions    proto.Actions // actions that are not accessible to STS users
 
 	control                 common.Control
+	fileWriteCtrl           *flowctrl.KeyFlowCtrl
 	rateLimit               RateLimiter
 	limitMutex              sync.RWMutex
 	disableCreateBucketByS3 bool
@@ -284,6 +320,31 @@ func (o *ObjectNode) loadConfig(cfg *config.Config) (err error) {
 			return
 		}
 		log.LogInfof("loadConfig: setup config: %v(%v)", configAuditLog, rawAuditLog)
+	}
+
+	// parse fileMaxMem config
+	if fileMaxMem := cfg.GetInt64(configFileMaxMemory); fileMaxMem > 0 {
+		sysFileMaxMem = fileMaxMem
+		log.LogInfof("loadConfig: setup config: %v(%v)", configFileMaxMemory, fileMaxMem)
+	}
+
+	// parse fileWriteBps config
+	if fileWriteMBps := cfg.GetInt(configFileWriteMBps); fileWriteMBps > 0 {
+		sysFileWriteBps = fileWriteMBps << 20
+		o.fileWriteCtrl = flowctrl.NewKeyFlowCtrl()
+		log.LogInfof("loadConfig: setup config: %v(%v)", configFileWriteMBps, fileWriteMBps)
+	}
+
+	// parse enableForceWriteFile config
+	sysForceWriteFile = cfg.GetBool(configForceWriteFile)
+	if sysForceWriteFile {
+		log.LogInfof("loadConfig: setup config: %v(%v)", configForceWriteFile, sysForceWriteFile)
+	}
+
+	// parse enableSyncReplication config
+	sysSyncReplication = cfg.GetBool(configSyncReplication)
+	if sysSyncReplication {
+		log.LogInfof("loadConfig: setup config: %v(%v)", configSyncReplication, sysSyncReplication)
 	}
 
 	// parse strict config

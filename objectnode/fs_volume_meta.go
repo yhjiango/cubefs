@@ -26,10 +26,12 @@ type ossMetaLoader interface {
 	loadACL() (p *AccessControlPolicy, err error)
 	loadCORS() (cors *CORSConfiguration, err error)
 	loadObjectLock() (config *ObjectLockConfig, err error)
+	loadReplication() (config *ReplicationConfig, err error)
 	storePolicy(p *Policy)
 	storeACL(p *AccessControlPolicy)
 	storeCORS(cors *CORSConfiguration)
 	storeObjectLock(config *ObjectLockConfig)
+	storeReplication(config *ReplicationConfig)
 	setSynced()
 }
 
@@ -50,10 +52,12 @@ type OSSMeta struct {
 	acl        *AccessControlPolicy
 	corsConfig *CORSConfiguration
 	lockConfig *ObjectLockConfig
+	replConfig *ReplicationConfig
 	policyLock sync.RWMutex
 	aclLock    sync.RWMutex
 	corsLock   sync.RWMutex
 	objectLock sync.RWMutex
+	replLock   sync.RWMutex
 }
 
 func (c *cacheMetaLoader) loadPolicy() (p *Policy, err error) {
@@ -156,6 +160,31 @@ func (c *cacheMetaLoader) storeObjectLock(config *ObjectLockConfig) {
 	return
 }
 
+func (c *cacheMetaLoader) loadReplication() (*ReplicationConfig, error) {
+	c.om.replLock.RLock()
+	repl := c.om.replConfig
+	c.om.replLock.RUnlock()
+	if repl == nil && atomic.LoadInt32(c.synced) == 0 {
+		ret, err, _ := c.sf.Do(XAttrKeyOSSReplication, func() (interface{}, error) {
+			return c.sml.loadReplication()
+		})
+		if err != nil {
+			return nil, err
+		}
+		repl = ret.(*ReplicationConfig)
+		c.storeReplication(repl)
+	}
+
+	return repl, nil
+}
+
+func (c *cacheMetaLoader) storeReplication(repl *ReplicationConfig) {
+	c.om.replLock.Lock()
+	c.om.replConfig = repl
+	c.om.replLock.Unlock()
+	return
+}
+
 func (c *cacheMetaLoader) setSynced() {
 	atomic.StoreInt32(c.synced, 1)
 }
@@ -189,6 +218,14 @@ func (s *strictMetaLoader) loadObjectLock() (o *ObjectLockConfig, err error) {
 }
 
 func (s *strictMetaLoader) storeObjectLock(cors *ObjectLockConfig) {
+	// do nothing
+}
+
+func (s *strictMetaLoader) loadReplication() (*ReplicationConfig, error) {
+	return s.v.loadBucketReplication()
+}
+
+func (s *strictMetaLoader) storeReplication(*ReplicationConfig) {
 	// do nothing
 }
 

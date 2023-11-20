@@ -90,6 +90,11 @@ var (
 	ObjectLockConfigurationNotFound     = &ErrorCode{"ObjectLockConfigurationNotFoundError", "Object Lock configuration does not exist for this bucket", http.StatusNotFound}
 	TooManyRequests                     = &ErrorCode{"TooManyRequests", "too many requests, please retry later", http.StatusTooManyRequests}
 	MalformedPOSTRequest                = &ErrorCode{ErrorCode: "MalformedPOSTRequest", ErrorMessage: "The body of your POST request is not well-formed multipart/form-data.", StatusCode: http.StatusBadRequest}
+	BadDigestETag                       = &ErrorCode{ErrorCode: "BadDigest", ErrorMessage: "The ETag you specified did not match what we received.", StatusCode: http.StatusBadRequest}
+	InvalidSourceACL                    = &ErrorCode{ErrorCode: "InvalidSourceACL", ErrorMessage: "The acl you specified is not valid.", StatusCode: http.StatusBadRequest}
+	InvalidInternalPutTime              = &ErrorCode{ErrorCode: "InvalidInternalPutTime", ErrorMessage: "The putTime we stored is not valid.", StatusCode: http.StatusInternalServerError}
+	InvalidSourcePutTime                = &ErrorCode{ErrorCode: "InvalidSourcePutTime", ErrorMessage: "The putTime you specified is not valid.", StatusCode: http.StatusBadRequest}
+	ObjectWithNewerPutTime              = &ErrorCode{ErrorCode: "ObjectWithNewerPutTime", ErrorMessage: "The putTime of an existing object is newer than the one you specified.", StatusCode: http.StatusBadRequest}
 )
 
 type ErrorCode struct {

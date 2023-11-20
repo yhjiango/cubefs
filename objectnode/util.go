@@ -15,6 +15,7 @@
 package objectnode
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/md5"
 	"crypto/sha1"
@@ -23,15 +24,19 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"fmt"
+	"io"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cubefs/cubefs/util"
+	"github.com/cubefs/cubefs/util/flowctrl"
 	"github.com/cubefs/cubefs/util/log"
 )
 
@@ -51,6 +56,12 @@ var (
 )
 
 var keyEscapedSkipBytes = []byte{'/', '*', '.', '-', '_'}
+
+var bufferPool = sync.Pool{
+	New: func() interface{} {
+		return new(bytes.Buffer)
+	},
+}
 
 // PathItem defines path node attribute information,
 // including node name and whether it is a directory.
@@ -422,4 +433,76 @@ func NewTLSConfig(clientCert, clientKey string) (*tls.Config, error) {
 	}
 
 	return &tlsConfig, nil
+}
+
+type ReaderAt struct {
+	io.ReaderAt
+	Off int64
+}
+
+func (r *ReaderAt) Read(p []byte) (n int, err error) {
+	n, err = r.ReadAt(p, r.Off)
+	r.Off += int64(n)
+	return
+}
+
+type bytesReadCloser struct {
+	*bytes.Reader
+	closer func() error
+	once   sync.Once
+}
+
+func (rc *bytesReadCloser) Close() error {
+	var err error
+	rc.once.Do(func() { err = rc.closer() })
+	return err
+}
+
+type File multipart.File
+
+func StreamFromFileWithCtrl(r io.Reader, maxMemory int64, ctrl *flowctrl.Controller) (File, error) {
+	buffer := bufferPool.Get().(*bytes.Buffer)
+	buffer.Reset()
+
+	n, err := io.CopyN(buffer, r, maxMemory+1)
+	if err != nil && err != io.EOF {
+		bufferPool.Put(buffer)
+		return nil, err
+	}
+	if n > maxMemory {
+		var f *os.File
+		// download the object into disk
+		if f, err = os.CreateTemp("", "object-*.rds"); err != nil {
+			bufferPool.Put(buffer)
+			return nil, err
+		}
+		fc := &fileCloser{f}
+		buf := make([]byte, 32*1024)
+		_, err = io.CopyBuffer(f, buffer, buf)
+		bufferPool.Put(buffer)
+		if err == nil {
+			if ctrl != nil {
+				r = flowctrl.NewRateReaderWithCtrl(r, ctrl)
+			}
+			_, err = io.CopyBuffer(f, r, buf)
+		}
+		if err != nil {
+			fc.Close()
+			return nil, err
+		}
+		if _, err = fc.Seek(0, 0); err != nil {
+			fc.Close()
+			return nil, err
+		}
+
+		return fc, nil
+	}
+
+	return &bytesReadCloser{
+		Reader: bytes.NewReader(buffer.Bytes()),
+		closer: func() error {
+			bufferPool.Put(buffer)
+			return nil
+		},
+	}, nil
 }
