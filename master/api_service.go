@@ -6338,7 +6338,7 @@ func (m *Server) SetCRR(w http.ResponseWriter, r *http.Request) {
 		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeParamError, Msg: err.Error()})
 		return
 	}
-	if _, err := isCRRConfigValid(m.cluster, param); err != nil {
+	if err := isCRRConfigValid(m, param); err != nil {
 		sendErrReply(w, r, &proto.HTTPReply{Code: proto.ErrCodeParamError, Msg: err.Error()})
 		return
 	}
@@ -6405,32 +6405,68 @@ func (m *Server) DeleteCRR(w http.ResponseWriter, r *http.Request) {
 	sendOkReply(w, r, newSuccessHTTPReply("success"))
 }
 
-func isCRRConfigValid(cluster *Cluster, param *proto.CRRConfiguration) (bool, error) {
+func isCRRConfigValid(m *Server, param *proto.CRRConfiguration) error {
 	if len(param.Rules) == 0 {
-		return false, errors.New("Rule is empty")
+		return errors.New("Rule is empty")
 	}
+	vols := m.cluster.vols
 	for _, rule := range param.Rules {
-		if rule.RuleID == "" {
-			return false, errors.New("RuleID is empty")
+		if !(strings.HasPrefix(rule.SrcS3Cfg.S3Addr, "http://") || strings.HasPrefix(rule.SrcS3Cfg.S3Addr, "https://")) ||
+			!(strings.HasPrefix(rule.DstS3Cfg.S3Addr, "http://") || strings.HasPrefix(rule.DstS3Cfg.S3Addr, "https://")) {
+			return errors.New("S3Addr is invalid")
 		}
-		if rule.Status != proto.CRRStatusEnabled && rule.Status != proto.CRRStatusDisabled {
-			return false, errors.New("Rule status is not valid")
+		srcVol, ok := vols[rule.SrcS3Cfg.VolName]
+		if !ok || srcVol.Status == markDelete {
+			return errors.NewErrorf("src volume(%s) not exist", rule.SrcS3Cfg.VolName)
+		}
+		srcUserInfo, _ := m.user.getUserInfo(srcVol.Owner)
+		rule.SrcS3Cfg.Auth = &proto.Auth{
+			AK: srcUserInfo.AccessKey,
+			SK: srcUserInfo.SecretKey,
+		}
+		rule.SrcS3Cfg.Region = m.clusterName
+		if err := proto.HeadBucket(&rule.SrcS3Cfg); err != nil {
+			return errors.NewErrorf("s3cfg(%s) not valid (%v)", err)
 		}
 		// same region
-		if rule.MasterAddr == "" {
-			if cluster.vols[param.VolName].Owner != cluster.vols[rule.DstVolName].Owner {
-				return false, errors.NewErrorf("Same region replication, but %s and %s do not belong to the same user",
-					param.VolName, rule.DstVolName)
+		if rule.DstMasterAddr == "" {
+			if dstVol, ok := vols[rule.DstS3Cfg.VolName]; !ok || dstVol.Status == markDelete {
+				return errors.NewErrorf("dst volume(%s) not exist", rule.DstS3Cfg.VolName)
+			}
+			if vols[param.VolName].Owner != vols[rule.DstS3Cfg.VolName].Owner {
+				return errors.NewErrorf("Same region replication, but %s and %s do not belong to the same user",
+					param.VolName, rule.DstS3Cfg.VolName)
+			}
+			rule.DstS3Cfg.Auth = rule.SrcS3Cfg.Auth
+			rule.DstS3Cfg.Region = rule.SrcS3Cfg.Region
+			if err := proto.HeadBucket(&rule.DstS3Cfg); err != nil {
+				return errors.NewErrorf("s3cfg(%s) not valid (%v)", err)
 			}
 			continue
 		}
 		// cross region
-		addr := []string{rule.MasterAddr}
+		addr := []string{rule.DstMasterAddr}
 		mc := master.NewMasterClient(addr, false)
-		_, err := mc.AdminAPI().GetVolumeSimpleInfo(rule.DstVolName)
+		dstVolView, err := mc.AdminAPI().GetVolumeSimpleInfo(rule.DstS3Cfg.VolName)
+		if err != nil || dstVolView.Status == markDelete {
+			return errors.NewErrorf("dst volume(%s) not exist", rule.DstS3Cfg.VolName)
+		}
+		dstUserInfo, err := mc.UserAPI().GetUserInfo(dstVolView.Owner)
 		if err != nil {
-			return false, err
+			return errors.NewErrorf("dst user(%s) not exist", dstVolView.Owner)
+		}
+		rule.DstS3Cfg.Auth = &proto.Auth{
+			AK: dstUserInfo.AccessKey,
+			SK: dstUserInfo.SecretKey,
+		}
+		dstClusterInfo, err := mc.AdminAPI().GetClusterInfo()
+		if err != nil {
+			return errors.NewErrorf(" get dst cluster info err(%v)", err)
+		}
+		rule.DstS3Cfg.Region = dstClusterInfo.Cluster
+		if err := proto.HeadBucket(&rule.DstS3Cfg); err != nil {
+			return errors.NewErrorf("s3cfg(%s) not valid (%v)", err)
 		}
 	}
-	return true, nil
+	return nil
 }

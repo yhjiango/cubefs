@@ -1605,6 +1605,26 @@ func (c *Cluster) loadCRRConfs() (err error) {
 		log.LogDebugf("loadCRRConfs volume[%v] rules[%+v]", CRRConf.VolName, CRRConf.Rules)
 		c.CRRMgr.SetCRR(CRRConf)
 	}
+
+	keyPrefix = CRRStatusPrefix
+	result, err = c.fsm.store.SeekForPrefix([]byte(keyPrefix))
+	if err != nil {
+		err = fmt.Errorf("loadCRRStatus get failed, err [%v]", err)
+		return err
+	}
+	for key, value := range result {
+		CRRStatus := &bsProto.CRRTaskStatistic{}
+		if err = json.Unmarshal(value, CRRStatus); err != nil {
+			err = fmt.Errorf("action[loadCRRStatus],value:%v,unmarshal err:%v", string(value), err)
+			return
+		}
+		taskId := strings.TrimPrefix(key, CRRStatusPrefix)
+		log.LogDebugf("loadCRRStatus taskId[%v] CRRStatus[%+v]", taskId, CRRStatus)
+		resp := &bsProto.CRRTaskResponse{
+			CRRTaskStatistic: *CRRStatus,
+		}
+		c.CRRMgr.CRRTaskStatus.AddCRRStatus(resp)
+	}
 	return
 }
 

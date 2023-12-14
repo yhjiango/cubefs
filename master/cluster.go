@@ -4354,8 +4354,7 @@ func (c *Cluster) addLcNode(nodeAddr string) (id uint64, err error) {
 	c.snapshotMgr.lcNodeStatus.Unlock()
 
 	c.CRRMgr.lcNodeStatus.Lock()
-	delete(c.CRRMgr.lcNodeStatus.WorkingNodes, nodeAddr)
-	c.CRRMgr.lcNodeStatus.IdleNodes[nodeAddr] = nodeAddr
+	c.CRRMgr.lcNodeStatus.WorkingCount[nodeAddr] = 0
 	c.CRRMgr.lcNodeStatus.Unlock()
 	log.LogInfof("action[addLcNode], clusterID[%v], lcNodeAddr: %v, id: %v, add idleNodes", c.Name, nodeAddr, ln.ID)
 	return ln.ID, nil
@@ -4497,9 +4496,14 @@ func (c *Cluster) startLcScan() {
 
 func (c *Cluster) scheduleToCRRScan() {
 	go func() {
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
 		for {
-			if c.partition != nil && c.partition.IsRaftLeader() {
-				c.startCRRScan()
+			select {
+			case <-ticker.C:
+				if c.partition != nil && c.partition.IsRaftLeader() {
+					c.startCRRScan()
+				}
 			}
 		}
 	}()

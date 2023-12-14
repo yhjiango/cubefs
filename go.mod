@@ -10,7 +10,7 @@ replace (
 require (
 	github.com/Shopify/sarama v1.33.0
 	github.com/afex/hystrix-go v0.0.0-20180502004556-fa1af6a1f4f5
-	github.com/aws/aws-sdk-go v1.33.1
+	github.com/aws/aws-sdk-go v1.40.36
 	github.com/benbjohnson/clock v1.3.1
 	github.com/bits-and-blooms/bitset v1.2.1
 	github.com/brahma-adshonor/gohook v1.1.9

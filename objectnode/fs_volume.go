@@ -532,7 +532,7 @@ func (v *Volume) ListFilesV1(opt *ListFilesV1Option) (result *ListFilesV1Result,
 	var prefixes Prefixes
 	var nextMarker string
 
-	infos, prefixes, nextMarker, err = v.listFilesV1(prefix, marker, delimiter, maxKeys, onlyObject)
+	infos, prefixes, nextMarker, err = v.listFilesV1(prefix, marker, delimiter, 10, onlyObject)
 	if err != nil {
 		log.LogErrorf("ListFilesV1: list fail: volume(%v) prefix(%v) marker(%v) delimiter(%v) maxKeys(%v) nextMarker(%v) err(%v)",
 			v.name, prefix, marker, delimiter, maxKeys, nextMarker, err)

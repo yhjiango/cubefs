@@ -1,6 +1,8 @@
 package master
 
 import (
+	"encoding/json"
+	"strings"
 	"sync"
 	"time"
 
@@ -8,35 +10,38 @@ import (
 	"github.com/cubefs/cubefs/util/log"
 )
 
+const saveMarkerDur = 30 * time.Second
+
 type CRRMgr struct {
 	sync.RWMutex
-	cluster           *Cluster
-	CRRConfig         map[string]*proto.CRRConfiguration
-	lcNodeStatus      *lcNodeStatus
-	CRRRuleTaskStatus *CRRRuleTaskStatus
-	idleLcNodeCh      chan struct{}
-	exitCh            chan struct{}
+	cluster       *Cluster
+	CRRConfig     map[string]*proto.CRRConfiguration
+	lcNodeStatus  *lcNodeStatus
+	CRRTaskStatus *CRRTaskStatus
+	idleLcNodeCh  chan struct{}
+	exitCh        chan struct{}
 }
 
 func newCRRMgr(cluster *Cluster) *CRRMgr {
 	log.LogInfof("action[newCRRMgr] construct")
 	mgr := &CRRMgr{
-		cluster:           cluster,
-		CRRConfig:         make(map[string]*proto.CRRConfiguration),
-		lcNodeStatus:      NewLcNodeStatus(),
-		CRRRuleTaskStatus: NewCRRRuleTaskStatus(),
-		idleLcNodeCh:      make(chan struct{}),
-		exitCh:            make(chan struct{}),
+		cluster:       cluster,
+		CRRConfig:     make(map[string]*proto.CRRConfiguration),
+		lcNodeStatus:  newLcNodeStatus(),
+		CRRTaskStatus: newCRRTaskStatus(),
+		idleLcNodeCh:  make(chan struct{}),
+		exitCh:        make(chan struct{}),
 	}
+	go mgr.saveCRRStatus()
 	return mgr
 }
 
-func (mgr *CRRMgr) SetCRR(CRRConf *proto.CRRConfiguration) {
+func (mgr *CRRMgr) SetCRR(conf *proto.CRRConfiguration) *proto.CRRConfiguration {
 	mgr.Lock()
 	defer mgr.Unlock()
 
-	mgr.CRRConfig[CRRConf.VolName] = CRRConf
-	return
+	mgr.CRRConfig[conf.VolName] = conf
+	return conf
 }
 
 func (mgr *CRRMgr) GetCRR(VolName string) (conf *proto.CRRConfiguration) {
@@ -60,123 +65,154 @@ func (mgr *CRRMgr) DeleteCRR(VolName string) {
 
 func (mgr *CRRMgr) startCRRScan() {
 	// stop if already scanning
-	if mgr.scanning() {
-		log.LogWarnf("rescheduleScanRoutine: scanning is not completed, CRRRuleTaskStatus(%v)", mgr.CRRRuleTaskStatus)
+	if mgr.isScanning() {
+		log.LogInfof("startCRRScan: scanning is not completed, CRRTaskStatus(%v)", mgr.CRRTaskStatus)
 		return
 	}
 
-	tasks := mgr.genEnabledRuleTasks()
+	tasks := mgr.genCRRTasks()
 	if len(tasks) <= 0 {
 		log.LogDebugf("startCRRScan: no crr rule task to schedule!")
 		return
 	}
 	log.LogDebugf("startCRRScan: %v crr rule tasks to schedule!", len(tasks))
 
-	// start scan init
-	mgr.lcNodeStatus.WorkingNodes = make(map[string]string)
-	mgr.CRRRuleTaskStatus = NewCRRRuleTaskStatus()
 	for _, r := range tasks {
-		mgr.CRRRuleTaskStatus.ToBeScanned[r.Id] = r
+		mgr.CRRTaskStatus.ToBeScanned[r.Id] = r
+		r.Rule.Marker = mgr.CRRTaskStatus.GetCRRStatus(r.Id).Marker
 	}
 
 	go mgr.process()
 }
 
-func (mgr *CRRMgr) genEnabledRuleTasks() []*proto.CRRTask {
+func (mgr *CRRMgr) saveCRRStatus() {
+	ticker := time.NewTicker(saveMarkerDur)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			mgr.recordCRRStatusToDB()
+		case <-mgr.exitCh:
+			mgr.recordCRRStatusToDB()
+			return
+		}
+	}
+}
+
+func (mgr *CRRMgr) recordCRRStatusToDB() {
+	mgr.CRRTaskStatus.RLock()
+	defer mgr.CRRTaskStatus.RUnlock()
+
+	for taskId, taskResp := range mgr.CRRTaskStatus.Results {
+		strs := strings.SplitN(taskId, ":", 3)
+		if time.Now().After(taskResp.UpdateTime.Add(2*saveMarkerDur)) || len(strs) < 3 {
+			continue
+		}
+		exist := false
+		CRRConf := mgr.GetCRR(strs[0])
+		if CRRConf != nil {
+			for _, rule := range CRRConf.Rules {
+				if rule.DstS3Cfg.VolName == strs[1] && rule.DstS3Cfg.Region == strs[2] {
+					exist = true
+				}
+			}
+		}
+		if !exist {
+			metadata := new(RaftCmd)
+			metadata.Op = opCRRStatusDelete
+			metadata.K = CRRStatusPrefix + taskId
+			if err := mgr.cluster.submit(metadata); err != nil {
+				log.LogErrorf("recordCRRStatusToDB: err(%v) ", err)
+				return
+			}
+		}
+		v, _ := json.Marshal(taskResp.CRRTaskStatistic)
+		metadata := new(RaftCmd)
+		metadata.Op = opCRRStatusSet
+		metadata.K = CRRStatusPrefix + taskId
+		metadata.V = v
+		if err := mgr.cluster.submit(metadata); err != nil {
+			log.LogErrorf("recordCRRStatusToDB: err(%v) ", err)
+			return
+		}
+	}
+
+}
+
+func (mgr *CRRMgr) genCRRTasks() []*proto.CRRTask {
 	mgr.RLock()
 	defer mgr.RUnlock()
 	tasks := make([]*proto.CRRTask, 0)
 	for _, v := range mgr.CRRConfig {
-		ts := v.GetEnabledRuleTasks()
-		if len(ts) > 0 {
-			tasks = append(tasks, ts...)
-		}
+		ts := v.GetCRRTasks()
+		tasks = append(tasks, ts...)
 	}
 	return tasks
 }
 
-func (mgr *CRRMgr) scanning() bool {
-	log.LogInfof("scanning lcNodeStatus: %v", mgr.lcNodeStatus)
-	if len(mgr.CRRRuleTaskStatus.ToBeScanned) > 0 {
+func (mgr *CRRMgr) isScanning() bool {
+	log.LogInfof("isScanning lcNodeStatus: %v", mgr.lcNodeStatus)
+	if len(mgr.CRRTaskStatus.ToBeScanned) > 0 {
 		return true
 	}
 
-	if len(mgr.CRRRuleTaskStatus.Scanning) > 0 {
-		scanning := mgr.CRRRuleTaskStatus.Scanning
-		var nodes []string
-		mgr.cluster.lcNodes.Range(func(addr, value interface{}) bool {
-			nodes = append(nodes, addr.(string))
+	for _, v := range mgr.CRRTaskStatus.Results {
+		if v.Done != true && time.Now().Before(v.UpdateTime.Add(time.Minute*10)) {
 			return true
-		})
-		for _, task := range scanning {
-			workingNodes := mgr.lcNodeStatus.WorkingNodes
-			var node string
-			for nodeAddr, t := range workingNodes {
-				if task.Id == t {
-					node = nodeAddr
-				}
-			}
-			if exist(node, nodes) {
-				log.LogInfof("scanning task: %v, exist node: %v, all nodes: %v", task, node, nodes)
-				return true
-			}
-			log.LogInfof("scanning task: %v, but not exist node: %v, all nodes: %v", task, node, nodes)
+		}
+	}
+
+	for _, c := range mgr.lcNodeStatus.WorkingCount {
+		if c > 0 {
+			return true
 		}
 	}
 	return false
 }
 
 func (mgr *CRRMgr) process() {
-	log.LogInfof("CRRMgr process start, rule num(%v)", len(mgr.CRRRuleTaskStatus.ToBeScanned))
+	log.LogInfof("CRRMgr process start, rule num(%v)", len(mgr.CRRTaskStatus.ToBeScanned))
 	now := time.Now()
-	mgr.CRRRuleTaskStatus.StartTime = &now
-	for mgr.scanning() {
-		log.LogDebugf("wait idleLcNodeCh... ToBeScanned num(%v), Scanning num(%v)",
-			len(mgr.CRRRuleTaskStatus.ToBeScanned), len(mgr.CRRRuleTaskStatus.Scanning))
+	mgr.CRRTaskStatus.StartTime = &now
+	for mgr.isScanning() {
+		log.LogDebugf("wait idleLcNodeCh... ToBeScanned num(%v)", len(mgr.CRRTaskStatus.ToBeScanned))
 		select {
 		case <-mgr.exitCh:
-			log.LogInfo("exitCh notified, lifecycleManager process exit")
+			log.LogInfo("exitCh notified, CRRMgr process exit")
 			return
 		case <-mgr.idleLcNodeCh:
 			log.LogDebug("idleLcNodeCh notified")
-
 			// ToBeScanned -> Scanning
-			taskId := mgr.CRRRuleTaskStatus.GetOneTask()
-			if taskId == "" {
-				log.LogWarn("CRRRuleTaskStatus.GetOneTask, no task")
+			task := mgr.CRRTaskStatus.GetOneTask()
+			if task == nil {
+				log.LogWarn("CRRTaskStatus.GetOneTask, no task to do")
 				continue
 			}
 
-			// idleNodes -> workingNodes
-			nodeAddr := mgr.lcNodeStatus.GetIdleNode(taskId)
+			nodeAddr := mgr.lcNodeStatus.GetIdleNode()
 			if nodeAddr == "" {
 				log.LogWarn("no idle lcnode, redo task")
-				mgr.CRRRuleTaskStatus.RedoTask(taskId)
+				mgr.CRRTaskStatus.RedoTask(task)
 				continue
 			}
 
 			val, ok := mgr.cluster.lcNodes.Load(nodeAddr)
 			if !ok {
 				log.LogErrorf("lcNodes.Load, nodeAddr(%v) is not available, redo task", nodeAddr)
-				mgr.CRRRuleTaskStatus.RedoTask(mgr.lcNodeStatus.RemoveNode(nodeAddr))
+				mgr.lcNodeStatus.RemoveNode(nodeAddr)
+				mgr.CRRTaskStatus.RedoTask(task)
 				continue
 			}
 
 			node := val.(*LcNode)
-			task := mgr.CRRRuleTaskStatus.GetTaskFromScanning(taskId) // task can not be nil
-			if task == nil {
-				log.LogErrorf("task is nil, release node(%v)", nodeAddr)
-				mgr.lcNodeStatus.ReleaseNode(nodeAddr)
-				continue
-			}
 			adminTask := node.createCRRTask(mgr.cluster.masterAddr(), task)
 			mgr.cluster.addLcNodeTasks([]*proto.AdminTask{adminTask})
 			log.LogDebugf("add CRR scan task(%v) to lcnode(%v)", *task, nodeAddr)
 		}
 	}
 	now = time.Now()
-	mgr.CRRRuleTaskStatus.EndTime = &now
-	log.LogInfof("CRRMgr process finish, lcRuleTaskStatus results(%v)", mgr.CRRRuleTaskStatus.Results)
+	mgr.CRRTaskStatus.EndTime = &now
+	log.LogInfof("CRRMgr process finish, lcRuleTaskStatus results(%v)", mgr.CRRTaskStatus.Results)
 }
 
 func (mgr *CRRMgr) notifyIdleLcNode() {
@@ -188,69 +224,57 @@ func (mgr *CRRMgr) notifyIdleLcNode() {
 	}
 }
 
-type CRRRuleTaskStatus struct {
+type CRRTaskStatus struct {
 	sync.RWMutex
-	ToBeScanned map[string]*proto.CRRTask               // task to be scanned
-	Scanning    map[string]*proto.CRRTask               // task being scanned
-	Results     map[string]*proto.LcNodeCRRTaskResponse // task scan results
+	ToBeScanned map[string]*proto.CRRTask         // task to be scanned
+	Results     map[string]*proto.CRRTaskResponse // task scan results
 	StartTime   *time.Time
 	EndTime     *time.Time
 }
 
-func NewCRRRuleTaskStatus() *CRRRuleTaskStatus {
-	return &CRRRuleTaskStatus{
+func newCRRTaskStatus() *CRRTaskStatus {
+	return &CRRTaskStatus{
 		ToBeScanned: make(map[string]*proto.CRRTask),
-		Scanning:    make(map[string]*proto.CRRTask),
-		Results:     make(map[string]*proto.LcNodeCRRTaskResponse),
+		Results:     make(map[string]*proto.CRRTaskResponse),
 	}
 }
 
-func (crs *CRRRuleTaskStatus) GetOneTask() (taskId string) {
+func (crs *CRRTaskStatus) GetOneTask() (task *proto.CRRTask) {
 	crs.Lock()
 	defer crs.Unlock()
 	if len(crs.ToBeScanned) == 0 {
 		return
 	}
-
-	for k, v := range crs.ToBeScanned {
-		taskId = k
-		crs.Scanning[k] = v
-		delete(crs.ToBeScanned, k)
-		return
+	for _, t := range crs.ToBeScanned {
+		task = t
+		break
 	}
+	delete(crs.ToBeScanned, task.Id)
 	return
 }
 
-func (crs *CRRRuleTaskStatus) RedoTask(taskId string) {
+func (crs *CRRTaskStatus) RedoTask(task *proto.CRRTask) {
 	crs.Lock()
 	defer crs.Unlock()
-	if taskId == "" {
+	if task == nil {
 		return
 	}
-
-	if task, ok := crs.Scanning[taskId]; ok {
-		crs.ToBeScanned[taskId] = task
-		delete(crs.Scanning, taskId)
-	}
+	crs.ToBeScanned[task.Id] = task
 }
 
-func (crs *CRRRuleTaskStatus) DeleteScanningTask(taskId string) {
-	crs.Lock()
-	defer crs.Unlock()
-	if taskId == "" {
-		return
-	}
-	delete(crs.Scanning, taskId)
-}
-
-func (crs *CRRRuleTaskStatus) GetTaskFromScanning(taskId string) *proto.CRRTask {
-	crs.Lock()
-	defer crs.Unlock()
-	return crs.Scanning[taskId]
-}
-
-func (crs *CRRRuleTaskStatus) AddResult(resp *proto.LcNodeCRRTaskResponse) {
+func (crs *CRRTaskStatus) AddCRRStatus(resp *proto.CRRTaskResponse) {
 	crs.Lock()
 	defer crs.Unlock()
 	crs.Results[resp.Id] = resp
+}
+
+func (crs *CRRTaskStatus) GetCRRStatus(taskId string) proto.CRRTaskStatistic {
+	crs.RLock()
+	defer crs.RUnlock()
+	status := proto.CRRTaskStatistic{}
+	res := crs.Results[taskId]
+	if res == nil {
+		return status
+	}
+	return res.CRRTaskStatistic
 }
